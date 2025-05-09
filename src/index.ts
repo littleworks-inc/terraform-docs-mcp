@@ -1,10 +1,51 @@
 #!/usr/bin/env node
+/// <reference lib="dom" />
 
 // Import from the correct paths
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { generateTerraformConfig } from './generator.js';
 import * as https from 'https';
+import { 
+  fetchResourceExamples, 
+  fetchResourceSchemaFromGithub, 
+  getRepoOrDiscover 
+} from './github.js';
+
+// Define TypeScript interfaces for better type safety
+interface ProviderDocsArgs {
+  provider: string;
+  resource?: string;
+  useGithub?: boolean;
+}
+
+interface GenerateConfigArgs {
+  provider: string;
+  resource: string;
+  attributes?: Record<string, any>;
+  useGithub?: boolean;
+}
+
+interface ResourceSchemaArgs {
+  provider: string;
+  resource: string;
+  useGithub?: boolean;
+}
+
+interface SchemaAttribute {
+  description: string;
+  required: boolean;
+  type?: string;
+}
+
+interface Schema {
+  attributes: Record<string, SchemaAttribute>;
+}
+
+interface GithubInfoArgs {
+  provider: string;
+}
 
 // Create server with proper arguments
 const server = new Server(
@@ -19,35 +60,9 @@ const server = new Server(
   }
 );
 
-// Define TypeScript interfaces for better type safety
-interface ProviderDocsArgs {
-  provider: string;
-  resource?: string;
-}
-
-interface GenerateConfigArgs {
-  provider: string;
-  resource: string;
-  attributes?: Record<string, any>;
-}
-
-interface ResourceSchemaArgs {
-  provider: string;
-  resource: string;
-}
-
-interface SchemaAttribute {
-  description: string;
-  required: boolean;
-  type?: string;
-}
-
-interface Schema {
-  attributes: Record<string, SchemaAttribute>;
-}
-
 // List available terraform generation tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
+  // Important: Use console.error instead of console.log
   console.error("Listing available Terraform tools");
   
   return {
@@ -65,6 +80,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             resource: { 
               type: "string", 
               description: "Resource name (e.g., instance, bucket, vpc)", 
+            },
+            useGithub: {
+              type: "boolean",
+              description: "Whether to use GitHub as an additional source for documentation",
             }
           },
           required: ["provider"]
@@ -87,6 +106,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             attributes: { 
               type: "object", 
               description: "Resource attributes to configure", 
+            },
+            useGithub: {
+              type: "boolean",
+              description: "Whether to use GitHub schema information",
             }
           },
           required: ["provider", "resource"]
@@ -105,9 +128,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             resource: { 
               type: "string", 
               description: "Resource name (e.g., instance, bucket, vpc)", 
+            },
+            useGithub: {
+              type: "boolean",
+              description: "Whether to use GitHub as the source for schema information",
             }
           },
           required: ["provider", "resource"]
+        }
+      },
+      {
+        name: "terraform_github_info",
+        description: "Get GitHub repository information for a Terraform provider",
+        inputSchema: {
+          type: "object",
+          properties: {
+            provider: {
+              type: "string",
+              description: "Provider name (e.g., aws, azure, gcp)",
+            }
+          },
+          required: ["provider"]
         }
       }
     ]
@@ -119,23 +160,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
   console.error(`Executing tool: ${request.params.name}`);
   
   try {
+    let response;
+    
     if (request.params.name === "terraform_provider_docs") {
-      return await fetchProviderDocs(request.params.arguments);
+      response = await fetchProviderDocs(request.params.arguments);
+    }
+    else if (request.params.name === "terraform_generate_config") {
+      response = await generateTerraformConfiguration(request.params.arguments);
+    }
+    else if (request.params.name === "terraform_resource_schema") {
+      response = await fetchResourceSchema(request.params.arguments);
+    }
+    else if (request.params.name === "terraform_github_info") {
+      response = await fetchGithubInfo(request.params.arguments);
+    }
+    else {
+      return {
+        error: {
+          message: `Unknown tool: ${request.params.name}`
+        }
+      };
     }
     
-    if (request.params.name === "terraform_generate_config") {
-      return await generateTerraformConfiguration(request.params.arguments);
-    }
-    
-    if (request.params.name === "terraform_resource_schema") {
-      return await fetchResourceSchema(request.params.arguments);
-    }
-    
-    return {
-      error: {
-        message: `Unknown tool: ${request.params.name}`
-      }
-    };
+    console.error(`Tool response: ${JSON.stringify(response)}`);
+    return response;
   } catch (error: any) {
     console.error("Error executing tool:", error);
     return {
@@ -165,13 +213,13 @@ function httpGet(url: string): Promise<string> {
   });
 }
 
-// Extract text from HTML
+// Simple HTML parser that extracts text from HTML (very basic)
 function extractText(html: string, selector: string): string {
-  // A simple implementation that looks for content in the main-content div
-  const contentStart = html.indexOf(selector);
-  if (contentStart === -1) return '';
+  // A very simple implementation - in a real scenario, you'd use a proper HTML parser
+  const mainContentStart = html.indexOf('main-content');
+  if (mainContentStart === -1) return '';
   
-  const startIdx = html.indexOf('>', contentStart) + 1;
+  const startIdx = html.indexOf('>', mainContentStart) + 1;
   const endIdx = html.indexOf('</div>', startIdx);
   
   return html.substring(startIdx, endIdx).trim();
@@ -182,7 +230,6 @@ function extractExamples(html: string): string[] {
   const examples: string[] = [];
   let searchPos = 0;
   
-  // Look for code blocks with the 'highlight' class
   while (true) {
     const highlightPos = html.indexOf('highlight', searchPos);
     if (highlightPos === -1) break;
@@ -201,77 +248,57 @@ function extractExamples(html: string): string[] {
   return examples;
 }
 
-// Extract attributes from documentation HTML
-function extractAttributes(html: string): Record<string, SchemaAttribute> {
-  const attributes: Record<string, SchemaAttribute> = {};
-  
-  // Look for argument tables in the HTML
-  const argumentTableStart = html.indexOf('Arguments Reference');
-  if (argumentTableStart === -1) return attributes;
-  
-  const tableStart = html.indexOf('<table', argumentTableStart);
-  if (tableStart === -1) return attributes;
-  
-  const tableEnd = html.indexOf('</table>', tableStart);
-  if (tableEnd === -1) return attributes;
-  
-  const tableContent = html.substring(tableStart, tableEnd);
-  
-  // Parse rows from the table
-  const rows = tableContent.split('<tr>').slice(1); // Skip header
-  
-  for (const row of rows) {
-    const cells = row.split('<td>').slice(1).map(cell => cell.split('</td>')[0].trim());
-    if (cells.length >= 2) {
-      const name = cells[0].replace(/<[^>]*>/g, '').trim();
-      const description = cells[1].replace(/<[^>]*>/g, '').trim();
-      const required = description.toLowerCase().includes('required');
-      const type = cells.length >= 3 ? cells[2].replace(/<[^>]*>/g, '').trim() : undefined;
-      
-      if (name) {
-        attributes[name] = {
-          description,
-          required,
-          type
-        };
-      }
-    }
-  }
-  
-  return attributes;
-}
-
 /**
- * Fetch provider documentation from Terraform Registry
+ * Fetch provider documentation from Terraform Registry and/or GitHub
  */
 async function fetchProviderDocs(args: ProviderDocsArgs) {
-  const { provider, resource } = args;
+  const { provider, resource, useGithub = false } = args;
   
   try {
-    let url = `https://registry.terraform.io/providers/hashicorp/${provider}/latest/docs`;
+    let registryUrl = `https://registry.terraform.io/providers/hashicorp/${provider}/latest/docs`;
     
     if (resource) {
-      url += `/resources/${resource}`;
+      registryUrl += `/resources/${resource}`;
     }
     
-    console.error(`Fetching documentation from: ${url}`);
+    console.error(`Fetching documentation from: ${registryUrl}`);
     
-    // Fetch the HTML content
-    const html = await httpGet(url);
-    
-    // Extract main content
+    // Get Registry documentation
+    const html = await httpGet(registryUrl);
     const docs = extractText(html, 'main-content');
+    const registryExamples = extractExamples(html);
     
-    // Extract code examples
-    const examples = extractExamples(html);
-    
-    return {
-      result: {
-        documentation: docs || `Documentation for ${provider}${resource ? `_${resource}` : ''}`,
-        examples: examples,
-        url: url
-      }
+    let result: {
+      documentation: string;
+      examples: string[];
+      url: string;
+      sources: string[];
+      githubRepo?: string;
+    } = {
+      documentation: docs || "Documentation content could not be extracted",
+      examples: registryExamples,
+      url: registryUrl,
+      sources: ["Terraform Registry"]
     };
+    
+    // If GitHub integration is enabled, fetch additional examples
+    if (useGithub && resource) {
+      console.error(`Fetching GitHub examples for: ${provider}_${resource}`);
+      const githubExamples = await fetchResourceExamples(provider, resource);
+      
+      if (githubExamples.length > 0) {
+        result.examples = [...registryExamples, ...githubExamples];
+        result.sources = [...result.sources, "GitHub"];
+      }
+      
+      // Get GitHub repository info
+      const repo = await getRepoOrDiscover(provider);
+      if (repo) {
+        result.githubRepo = `https://github.com/${repo.owner}/${repo.name}`;
+      }
+    }
+    
+    return { result };
   } catch (error: any) {
     console.error("Error fetching provider docs:", error);
     return {
@@ -286,13 +313,13 @@ async function fetchProviderDocs(args: ProviderDocsArgs) {
  * Generate Terraform configuration based on provider and resource
  */
 async function generateTerraformConfiguration(args: GenerateConfigArgs) {
-  const { provider, resource, attributes = {} } = args;
+  const { provider, resource, attributes = {}, useGithub = false } = args;
   
   try {
     console.error(`Generating Terraform configuration for ${provider}_${resource}`);
     
-    // First, get the resource schema
-    const schemaResponse = await fetchResourceSchema({ provider, resource });
+    // Get the resource schema
+    const schemaResponse = await fetchResourceSchema({ provider, resource, useGithub });
     
     if (schemaResponse.error) {
       return schemaResponse;
@@ -300,9 +327,10 @@ async function generateTerraformConfiguration(args: GenerateConfigArgs) {
     
     const schema = schemaResponse.result;
     
-    // Generate Terraform configuration
-    const configuration = generateConfig(provider, resource, schema, attributes);
+    // Generate Terraform configuration using the schema and provided attributes
+    const configuration = generateTerraformConfig(provider, resource, schema, attributes);
     
+    // Return the configuration
     return {
       result: configuration
     };
@@ -317,65 +345,83 @@ async function generateTerraformConfiguration(args: GenerateConfigArgs) {
 }
 
 /**
- * Fetch resource schema from Terraform Registry
+ * Fetch resource schema from simulated data or GitHub
  */
 async function fetchResourceSchema(args: ResourceSchemaArgs) {
-  const { provider, resource } = args;
+  const { provider, resource, useGithub = false } = args;
   
   try {
-    // Form the URL to the resource documentation
-    const url = `https://registry.terraform.io/providers/hashicorp/${provider}/latest/docs/resources/${resource}`;
+    console.error(`Fetching schema for: ${provider}_${resource}`);
     
-    console.error(`Fetching schema from: ${url}`);
-    
-    // Fetch the HTML content
-    const html = await httpGet(url);
-    
-    // Extract attributes from the documentation
-    const attributes = extractAttributes(html);
-    
-    // If no attributes were found, provide some defaults
-    if (Object.keys(attributes).length === 0) {
-      // Use provider-specific defaults if we know them
-      if (provider === 'aws' && resource === 'instance') {
-        attributes.ami = {
-          description: "The AMI to use for the instance",
-          required: true,
-          type: "string"
+    // If GitHub integration is enabled, try to fetch schema from there first
+    if (useGithub) {
+      try {
+        console.error("Attempting to fetch schema from GitHub...");
+        const githubSchema = await fetchResourceSchemaFromGithub(provider, resource);
+        return {
+          result: githubSchema,
+          source: "GitHub"
         };
-        attributes.instance_type = {
-          description: "The instance type to use",
-          required: true,
-          type: "string"
-        };
-      } else if (provider === 'aws' && resource === 's3_bucket') {
-        attributes.bucket = {
-          description: "The name of the bucket",
-          required: true,
-          type: "string"
-        };
-        attributes.acl = {
-          description: "The canned ACL to apply",
-          required: false,
-          type: "string"
-        };
-      } else {
-        // Generic defaults
-        attributes.name = {
-          description: "The name of the resource",
-          required: true,
-          type: "string"
-        };
+      } catch (githubError) {
+        console.error("Failed to fetch schema from GitHub, falling back to simulated data:", githubError);
       }
     }
     
-    // Create the schema
+    // Create a simulated schema with a proper structure as fallback
     const schema: Schema = {
-      attributes
+      attributes: {
+        name: {
+          description: "The name of the resource",
+          required: true,
+          type: "string"
+        },
+        tags: {
+          description: "Tags to assign to the resource",
+          required: false,
+          type: "map"
+        }
+      }
     };
     
+    // Add provider-specific attributes
+    if (provider === 'aws' && resource === 'instance') {
+      schema.attributes.ami = {
+        description: "The AMI to use for the instance",
+        required: true,
+        type: "string"
+      };
+      schema.attributes.instance_type = {
+        description: "The instance type to use",
+        required: true,
+        type: "string"
+      };
+    } else if (provider === 'aws' && resource === 's3_bucket') {
+      schema.attributes.bucket = {
+        description: "The name of the bucket",
+        required: true,
+        type: "string"
+      };
+      schema.attributes.acl = {
+        description: "The canned ACL to apply",
+        required: false,
+        type: "string"
+      };
+    } else if (provider === 'gcp' && resource === 'compute_instance') {
+      schema.attributes.machine_type = {
+        description: "The machine type to create",
+        required: true,
+        type: "string"
+      };
+      schema.attributes.zone = {
+        description: "The zone that the machine should be created in",
+        required: true,
+        type: "string"
+      };
+    }
+    
     return {
-      result: schema
+      result: schema,
+      source: "Simulated Data"
     };
   } catch (error: any) {
     console.error("Error fetching resource schema:", error);
@@ -388,198 +434,57 @@ async function fetchResourceSchema(args: ResourceSchemaArgs) {
 }
 
 /**
- * Generate Terraform configuration based on provider, resource, schema and attributes
+ * Fetch GitHub repository information for a provider
  */
-function generateConfig(
-  provider: string,
-  resource: string,
-  schema: Schema,
-  attributes: Record<string, any> = {}
-): string {
-  // Format the resource name
-  const resourceType = `${provider}_${resource}`;
-  const resourceName = resource.replace(/-/g, '_');
+async function fetchGithubInfo(args: GithubInfoArgs) {
+  const { provider } = args;
   
-  // Start building the configuration
-  let config = `# Terraform configuration for ${resourceType}\n\n`;
-  
-  // Add provider block
-  config += `provider "${provider}" {\n`;
-  
-  // Common provider attributes
-  if (provider === 'aws') {
-    config += `  region = "${attributes.region || "us-west-2"}"\n`;
-  } else if (provider === 'azurerm') {
-    config += `  features {}\n`;
-  } else if (provider === 'google') {
-    config += `  project = "${attributes.project || "my-project-id"}"\n`;
-  }
-  
-  config += `}\n\n`;
-  
-  // Add resource block
-  config += `resource "${resourceType}" "${resourceName}_example" {\n`;
-  
-  // Add required attributes
-  const requiredAttrs = Object.entries(schema.attributes)
-    .filter(([_, attr]) => attr.required);
+  try {
+    console.error(`Fetching GitHub info for provider: ${provider}`);
     
-  for (const [name, attr] of requiredAttrs) {
-    const value = getAttributeValue(name, attr, attributes);
-    if (value !== null) {
-      config += `  ${name} = ${value}\n`;
-    }
-  }
-  
-  // Add optional attributes that have been provided
-  const optionalAttrs = Object.entries(schema.attributes)
-    .filter(([_, attr]) => !attr.required)
-    .filter(([name]) => name in attributes);
+    const repo = await getRepoOrDiscover(provider);
     
-  if (optionalAttrs.length > 0) {
-    config += '\n  # Optional attributes\n';
-    
-    for (const [name, attr] of optionalAttrs) {
-      const value = getAttributeValue(name, attr, attributes);
-      if (value !== null) {
-        config += `  ${name} = ${value}\n`;
-      }
-    }
-  }
-  
-  // Add tags if they exist
-  if (attributes.tags && typeof attributes.tags === 'object') {
-    config += '\n  tags = {\n';
-    for (const [key, value] of Object.entries(attributes.tags)) {
-      config += `    ${key} = "${value}"\n`;
-    }
-    config += '  }\n';
-  }
-  
-  config += `}\n`;
-  
-  return config;
-}
-
-/**
- * Get the formatted value for an attribute
- */
-function getAttributeValue(
-  name: string,
-  attr: SchemaAttribute,
-  attributes: Record<string, any>
-): string | null {
-  // If the value is explicitly provided, use it
-  if (name in attributes) {
-    const value = attributes[name];
-    
-    // Format the value based on its type
-    if (typeof value === 'string') {
-      return `"${value}"`;
-    } else if (typeof value === 'number') {
-      return value.toString();
-    } else if (typeof value === 'boolean') {
-      return value.toString();
-    } else if (Array.isArray(value)) {
-      return formatArray(value);
-    } else if (typeof value === 'object' && value !== null && name !== 'tags') {
-      return formatObject(value);
-    }
-    
-    return `"${value}"`;
-  }
-  
-  // Provide reasonable defaults based on attribute name and context
-  switch (name) {
-    case 'name':
-      return `"example-resource"`;
-    case 'ami':
-      return `"ami-12345678"`;
-    case 'instance_type':
-      return `"t2.micro"`;
-    case 'bucket':
-      return `"example-terraform-bucket"`;
-    case 'acl':
-      return `"private"`;
-    case 'zone':
-      return `"us-central1-a"`;
-    case 'machine_type':
-      return `"e2-medium"`;
-    default:
-      // For other required attributes, provide a placeholder
-      if (attr.required) {
-        // Different defaults based on typical attribute types
-        if (name.includes('id')) {
-          return `"example-id"`;
-        } else if (name.includes('arn')) {
-          return `"arn:aws:example:region:account-id:resource/example"`;
-        } else if (name.includes('type')) {
-          return `"standard"`;
+    if (!repo) {
+      return {
+        error: {
+          message: `Could not find GitHub repository for provider: ${provider}`
         }
-        
-        return `"TODO: required-value-for-${name}"`;
+      };
+    }
+    
+    return {
+      result: {
+        owner: repo.owner,
+        name: repo.name,
+        defaultBranch: repo.defaultBranch,
+        url: `https://github.com/${repo.owner}/${repo.name}`,
+        apiUrl: `https://api.github.com/repos/${repo.owner}/${repo.name}`
       }
-      
-      // Skip optional attributes if not provided
-      return null;
+    };
+  } catch (error: any) {
+    console.error("Error fetching GitHub info:", error);
+    return {
+      error: {
+        message: `Failed to fetch GitHub repository information: ${error.message}`
+      }
+    };
   }
-}
-
-/**
- * Format an array value
- */
-function formatArray(array: any[]): string {
-  if (array.length === 0) {
-    return '[]';
-  }
-  
-  const items = array.map(item => {
-    if (typeof item === 'string') {
-      return `"${item}"`;
-    } else if (typeof item === 'number') {
-      return item.toString();
-    } else if (typeof item === 'boolean') {
-      return item.toString();
-    } else if (typeof item === 'object' && item !== null) {
-      return formatObject(item);
-    }
-    return `"${item}"`;
-  });
-  
-  return `[\n    ${items.join(',\n    ')}\n  ]`;
-}
-
-/**
- * Format an object value
- */
-function formatObject(obj: Record<string, any>): string {
-  if (Object.keys(obj).length === 0) {
-    return '{}';
-  }
-  
-  const entries = Object.entries(obj).map(([key, value]) => {
-    if (typeof value === 'string') {
-      return `    ${key} = "${value}"`;
-    } else if (typeof value === 'number') {
-      return `    ${key} = ${value}`;
-    } else if (typeof value === 'boolean') {
-      return `    ${key} = ${value}`;
-    } else if (Array.isArray(value)) {
-      return `    ${key} = ${formatArray(value)}`;
-    } else if (typeof value === 'object' && value !== null) {
-      return `    ${key} = ${formatObject(value)}`;
-    }
-    return `    ${key} = "${value}"`;
-  });
-  
-  return `{\n${entries.join('\n')}\n  }`;
 }
 
 // Create a stdio server for MCP
-const transport = new StdioServerTransport();
-server.connect(transport).then(() => {
-  console.error("MCP Server started successfully!");
-}).catch((error: any) => {
+function createStdioServer(server: Server) {
+  const transport = new StdioServerTransport();
+  
+  return {
+    async start() {
+      await server.connect(transport);
+      console.error("MCP Server started successfully!");
+    }
+  };
+}
+
+const stdioServer = createStdioServer(server);
+stdioServer.start().catch((error: any) => {
   console.error("Error starting server:", error);
   process.exit(1);
 });
