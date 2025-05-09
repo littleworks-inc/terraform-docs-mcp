@@ -1,23 +1,14 @@
 #!/usr/bin/env node
+/// <reference lib="dom" />
 
 // Import from the correct paths
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { generateTerraformConfig } from './generator.js';
 import * as https from 'https';
-
-// Create server with proper arguments
-const server = new Server(
-  { 
-    name: "terraform-docs-mcp", 
-    version: "0.1.0" 
-  },
-  { 
-    capabilities: { 
-      tools: {} 
-    } 
-  }
-);
+// Import cheerio for better HTML parsing
+import * as cheerio from 'cheerio';
 
 // Define TypeScript interfaces for better type safety
 interface ProviderDocsArgs {
@@ -46,8 +37,29 @@ interface Schema {
   attributes: Record<string, SchemaAttribute>;
 }
 
+interface DocInfo {
+  documentation: string;
+  examples: string[];
+  attrs: Record<string, SchemaAttribute>;
+  url: string;
+}
+
+// Create server with proper arguments
+const server = new Server(
+  { 
+    name: "terraform-docs-mcp", 
+    version: "0.1.0" 
+  },
+  { 
+    capabilities: { 
+      tools: {} 
+    } 
+  }
+);
+
 // List available terraform generation tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
+  // Important: Use console.error instead of console.log
   console.error("Listing available Terraform tools");
   
   return {
@@ -114,39 +126,133 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+// Type guard to ensure provider arguments
+function isProviderDocsArgs(args: any): args is ProviderDocsArgs {
+  return typeof args === 'object' && args !== null && typeof args.provider === 'string';
+}
+
+// Type guard to ensure resource arguments
+function isResourceSchemaArgs(args: any): args is ResourceSchemaArgs {
+  return typeof args === 'object' && args !== null && 
+         typeof args.provider === 'string' && 
+         typeof args.resource === 'string';
+}
+
+// Type guard to ensure config arguments
+function isGenerateConfigArgs(args: any): args is GenerateConfigArgs {
+  return typeof args === 'object' && args !== null && 
+         typeof args.provider === 'string' && 
+         typeof args.resource === 'string';
+}
+
 // Handle tool execution
-server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
   console.error(`Executing tool: ${request.params.name}`);
   
   try {
-    if (request.params.name === "terraform_provider_docs") {
-      return await fetchProviderDocs(request.params.arguments);
-    }
-    
-    if (request.params.name === "terraform_generate_config") {
-      return await generateTerraformConfiguration(request.params.arguments);
-    }
-    
-    if (request.params.name === "terraform_resource_schema") {
-      return await fetchResourceSchema(request.params.arguments);
-    }
-    
-    return {
-      error: {
-        message: `Unknown tool: ${request.params.name}`
-      }
+    // Compatible response structure for both platforms
+    let response: any = {
+      // For cline.bot: content array is required
+      content: []
     };
+    
+    if (request.params.name === "terraform_provider_docs") {
+      // Type safety check
+      if (!request.params.arguments || !isProviderDocsArgs(request.params.arguments)) {
+        throw new Error("Invalid arguments: provider is required");
+      }
+      
+      const providerInfo = await fetchProviderDocs(request.params.arguments);
+      
+      // For Claude Desktop: result property
+      response.result = providerInfo;
+      
+      // For cline.bot: content array
+      response.content = [
+        {
+          type: "text",
+          text: `Documentation for ${request.params.arguments.provider}${request.params.arguments.resource ? '_' + request.params.arguments.resource : ''}:\n\n${providerInfo.documentation}\n\nExamples:\n${providerInfo.examples.join('\n\n')}`
+        }
+      ];
+    }
+    else if (request.params.name === "terraform_generate_config") {
+      // Type safety check
+      if (!request.params.arguments || !isGenerateConfigArgs(request.params.arguments)) {
+        throw new Error("Invalid arguments: provider and resource are required");
+      }
+      
+      const schema = await fetchResourceSchema(request.params.arguments);
+      const terraformConfig = generateTerraformConfig(
+        request.params.arguments.provider, 
+        request.params.arguments.resource, 
+        schema, 
+        request.params.arguments.attributes || {}
+      );
+      
+      // For Claude Desktop: result property
+      response.result = terraformConfig;
+      
+      // For cline.bot: content array
+      response.content = [
+        {
+          type: "text",
+          text: `Generated Terraform Configuration:\n\n\`\`\`hcl\n${terraformConfig}\n\`\`\``
+        }
+      ];
+    }
+    else if (request.params.name === "terraform_resource_schema") {
+      // Type safety check
+      if (!request.params.arguments || !isResourceSchemaArgs(request.params.arguments)) {
+        throw new Error("Invalid arguments: provider and resource are required");
+      }
+      
+      const schema = await fetchResourceSchema(request.params.arguments);
+      
+      // For Claude Desktop: result property
+      response.result = schema;
+      
+      // For cline.bot: content array
+      response.content = [
+        {
+          type: "text",
+          text: `Schema for ${request.params.arguments.provider}_${request.params.arguments.resource}:\n\n\`\`\`json\n${JSON.stringify(schema, null, 2)}\n\`\`\``
+        }
+      ];
+    }
+    else {
+      // Error response for unknown tool
+      response = {
+        error: {
+          message: `Unknown tool: ${request.params.name}`
+        },
+        content: [
+          {
+            type: "text",
+            text: `Unknown tool: ${request.params.name}`
+          }
+        ]
+      };
+    }
+    
+    console.error(`Tool response: ${JSON.stringify(response)}`);
+    return response;
   } catch (error: any) {
     console.error("Error executing tool:", error);
     return {
       error: {
         message: `Error executing tool: ${error.message}`
-      }
+      },
+      content: [
+        {
+          type: "text",
+          text: `Error executing tool: ${error.message}`
+        }
+      ]
     };
   }
 });
 
-// Simple HTTP request function that doesn't use axios
+// HTTP request function to fetch documentation
 function httpGet(url: string): Promise<string> {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
@@ -165,90 +271,42 @@ function httpGet(url: string): Promise<string> {
   });
 }
 
-// Extract text from HTML
-function extractText(html: string, selector: string): string {
-  // A simple implementation that looks for content in the main-content div
-  const contentStart = html.indexOf(selector);
-  if (contentStart === -1) return '';
+// Get the correct Terraform Registry provider name
+function getProviderSlug(provider: string): string {
+  const providerMappings: Record<string, string> = {
+    'azure': 'azurerm',
+    'gcp': 'google',
+    'google-cloud': 'google',
+    'digitalocean': 'digitalocean',
+    'aws': 'aws',
+    'kubernetes': 'kubernetes',
+    'k8s': 'kubernetes',
+    'github': 'github',
+    'gitlab': 'gitlab',
+    'azuread': 'azuread',
+    'cloudflare': 'cloudflare',
+    'docker': 'docker',
+    'helm': 'helm',
+    'oci': 'oci',
+    'oracle': 'oci',
+    'vsphere': 'vsphere'
+  };
   
-  const startIdx = html.indexOf('>', contentStart) + 1;
-  const endIdx = html.indexOf('</div>', startIdx);
-  
-  return html.substring(startIdx, endIdx).trim();
-}
-
-// Extract examples from HTML
-function extractExamples(html: string): string[] {
-  const examples: string[] = [];
-  let searchPos = 0;
-  
-  // Look for code blocks with the 'highlight' class
-  while (true) {
-    const highlightPos = html.indexOf('highlight', searchPos);
-    if (highlightPos === -1) break;
-    
-    const startPos = html.indexOf('>', highlightPos) + 1;
-    const endPos = html.indexOf('</pre>', startPos);
-    
-    if (startPos > 0 && endPos > startPos) {
-      examples.push(html.substring(startPos, endPos).trim());
-      searchPos = endPos;
-    } else {
-      break;
-    }
-  }
-  
-  return examples;
-}
-
-// Extract attributes from documentation HTML
-function extractAttributes(html: string): Record<string, SchemaAttribute> {
-  const attributes: Record<string, SchemaAttribute> = {};
-  
-  // Look for argument tables in the HTML
-  const argumentTableStart = html.indexOf('Arguments Reference');
-  if (argumentTableStart === -1) return attributes;
-  
-  const tableStart = html.indexOf('<table', argumentTableStart);
-  if (tableStart === -1) return attributes;
-  
-  const tableEnd = html.indexOf('</table>', tableStart);
-  if (tableEnd === -1) return attributes;
-  
-  const tableContent = html.substring(tableStart, tableEnd);
-  
-  // Parse rows from the table
-  const rows = tableContent.split('<tr>').slice(1); // Skip header
-  
-  for (const row of rows) {
-    const cells = row.split('<td>').slice(1).map(cell => cell.split('</td>')[0].trim());
-    if (cells.length >= 2) {
-      const name = cells[0].replace(/<[^>]*>/g, '').trim();
-      const description = cells[1].replace(/<[^>]*>/g, '').trim();
-      const required = description.toLowerCase().includes('required');
-      const type = cells.length >= 3 ? cells[2].replace(/<[^>]*>/g, '').trim() : undefined;
-      
-      if (name) {
-        attributes[name] = {
-          description,
-          required,
-          type
-        };
-      }
-    }
-  }
-  
-  return attributes;
+  return providerMappings[provider.toLowerCase()] || provider.toLowerCase();
 }
 
 /**
  * Fetch provider documentation from Terraform Registry
  */
-async function fetchProviderDocs(args: ProviderDocsArgs) {
+async function fetchProviderDocs(args: ProviderDocsArgs): Promise<DocInfo> {
   const { provider, resource } = args;
   
   try {
-    let url = `https://registry.terraform.io/providers/hashicorp/${provider}/latest/docs`;
+    // Map provider name to Terraform Registry format
+    const providerSlug = getProviderSlug(provider);
+    
+    // Construct URL for documentation
+    let url = `https://registry.terraform.io/providers/hashicorp/${providerSlug}/latest/docs`;
     
     if (resource) {
       url += `/resources/${resource}`;
@@ -256,330 +314,169 @@ async function fetchProviderDocs(args: ProviderDocsArgs) {
     
     console.error(`Fetching documentation from: ${url}`);
     
-    // Fetch the HTML content
     const html = await httpGet(url);
     
-    // Extract main content
-    const docs = extractText(html, 'main-content');
+    // Use cheerio for better HTML parsing
+    const $ = cheerio.load(html);
+    const documentation = $('.main-content').text().trim();
     
     // Extract code examples
-    const examples = extractExamples(html);
+    const examples: string[] = [];
+    $('.highlight pre').each((i, element) => {
+      examples.push($(element).text().trim());
+    });
+    
+    // Extract attribute descriptions
+    const attrs: Record<string, SchemaAttribute> = {};
+    
+    // Find argument section - often has a heading like "Argument Reference"
+    $('.main-content h2, .main-content h3').each((i, element) => {
+      const heading = $(element).text().trim();
+      if (heading.includes('Argument') || heading.includes('Arguments')) {
+        let currentElement = $(element).next();
+        
+        // Extract attribute information from lists after the heading
+        while (currentElement.length && !currentElement.is('h2, h3')) {
+          if (currentElement.is('ul, dl')) {
+            currentElement.find('li, dt').each((j, item) => {
+              const itemText = $(item).text().trim();
+              
+              // Parse attribute information: typically in format "name - (Required|Optional) description"
+              const nameMatch = itemText.match(/^`?([a-zA-Z0-9_]+)`?\s*-\s*/);
+              
+              if (nameMatch) {
+                const name = nameMatch[1];
+                const required = itemText.includes('(Required)');
+                const description = itemText.replace(/^`?([a-zA-Z0-9_]+)`?\s*-\s*(\(Required\)|\(Optional\))?/, '').trim();
+                
+                // Guess the type from the description
+                let type = 'string'; // Default type
+                if (description.includes('list') || description.includes('array')) {
+                  type = 'list';
+                } else if (description.includes('map') || description.includes('object')) {
+                  type = 'map';
+                } else if (description.includes('boolean') || description.includes('true') || description.includes('false')) {
+                  type = 'boolean';
+                } else if (description.includes('number') || description.includes('integer')) {
+                  type = 'number';
+                }
+                
+                attrs[name] = {
+                  description,
+                  required,
+                  type
+                };
+              }
+            });
+          }
+          currentElement = currentElement.next();
+        }
+      }
+    });
     
     return {
-      result: {
-        documentation: docs || `Documentation for ${provider}${resource ? `_${resource}` : ''}`,
-        examples: examples,
-        url: url
-      }
+      documentation: documentation || "Documentation content could not be extracted",
+      examples: examples,
+      attrs: attrs,
+      url: url
     };
   } catch (error: any) {
     console.error("Error fetching provider docs:", error);
-    return {
-      error: {
-        message: `Failed to fetch provider documentation: ${error.message}`
-      }
-    };
+    throw new Error(`Failed to fetch provider documentation: ${error.message}`);
   }
 }
 
 /**
- * Generate Terraform configuration based on provider and resource
+ * Fetch resource schema by parsing Terraform documentation
  */
-async function generateTerraformConfiguration(args: GenerateConfigArgs) {
-  const { provider, resource, attributes = {} } = args;
-  
-  try {
-    console.error(`Generating Terraform configuration for ${provider}_${resource}`);
-    
-    // First, get the resource schema
-    const schemaResponse = await fetchResourceSchema({ provider, resource });
-    
-    if (schemaResponse.error) {
-      return schemaResponse;
-    }
-    
-    const schema = schemaResponse.result;
-    
-    // Generate Terraform configuration
-    const configuration = generateConfig(provider, resource, schema, attributes);
-    
-    return {
-      result: configuration
-    };
-  } catch (error: any) {
-    console.error("Error generating Terraform configuration:", error);
-    return {
-      error: {
-        message: `Failed to generate Terraform configuration: ${error.message}`
-      }
-    };
-  }
-}
-
-/**
- * Fetch resource schema from Terraform Registry
- */
-async function fetchResourceSchema(args: ResourceSchemaArgs) {
+async function fetchResourceSchema(args: ResourceSchemaArgs): Promise<Schema> {
   const { provider, resource } = args;
   
   try {
-    // Form the URL to the resource documentation
-    const url = `https://registry.terraform.io/providers/hashicorp/${provider}/latest/docs/resources/${resource}`;
+    console.error(`Fetching schema for: ${provider}_${resource}`);
     
-    console.error(`Fetching schema from: ${url}`);
+    // Get documentation which includes argument information
+    const docInfo = await fetchProviderDocs({ provider, resource });
     
-    // Fetch the HTML content
-    const html = await httpGet(url);
-    
-    // Extract attributes from the documentation
-    const attributes = extractAttributes(html);
-    
-    // If no attributes were found, provide some defaults
-    if (Object.keys(attributes).length === 0) {
-      // Use provider-specific defaults if we know them
-      if (provider === 'aws' && resource === 'instance') {
-        attributes.ami = {
-          description: "The AMI to use for the instance",
-          required: true,
-          type: "string"
-        };
-        attributes.instance_type = {
-          description: "The instance type to use",
-          required: true,
-          type: "string"
-        };
-      } else if (provider === 'aws' && resource === 's3_bucket') {
-        attributes.bucket = {
-          description: "The name of the bucket",
-          required: true,
-          type: "string"
-        };
-        attributes.acl = {
-          description: "The canned ACL to apply",
-          required: false,
-          type: "string"
-        };
-      } else {
-        // Generic defaults
-        attributes.name = {
-          description: "The name of the resource",
-          required: true,
-          type: "string"
-        };
-      }
-    }
-    
-    // Create the schema
+    // Create schema object from extracted attributes
     const schema: Schema = {
-      attributes
+      attributes: docInfo.attrs || {}
     };
     
-    return {
-      result: schema
-    };
-  } catch (error: any) {
-    console.error("Error fetching resource schema:", error);
-    return {
-      error: {
-        message: `Failed to fetch resource schema: ${error.message}`
-      }
-    };
-  }
-}
-
-/**
- * Generate Terraform configuration based on provider, resource, schema and attributes
- */
-function generateConfig(
-  provider: string,
-  resource: string,
-  schema: Schema,
-  attributes: Record<string, any> = {}
-): string {
-  // Format the resource name
-  const resourceType = `${provider}_${resource}`;
-  const resourceName = resource.replace(/-/g, '_');
-  
-  // Start building the configuration
-  let config = `# Terraform configuration for ${resourceType}\n\n`;
-  
-  // Add provider block
-  config += `provider "${provider}" {\n`;
-  
-  // Common provider attributes
-  if (provider === 'aws') {
-    config += `  region = "${attributes.region || "us-west-2"}"\n`;
-  } else if (provider === 'azurerm') {
-    config += `  features {}\n`;
-  } else if (provider === 'google') {
-    config += `  project = "${attributes.project || "my-project-id"}"\n`;
-  }
-  
-  config += `}\n\n`;
-  
-  // Add resource block
-  config += `resource "${resourceType}" "${resourceName}_example" {\n`;
-  
-  // Add required attributes
-  const requiredAttrs = Object.entries(schema.attributes)
-    .filter(([_, attr]) => attr.required);
-    
-  for (const [name, attr] of requiredAttrs) {
-    const value = getAttributeValue(name, attr, attributes);
-    if (value !== null) {
-      config += `  ${name} = ${value}\n`;
-    }
-  }
-  
-  // Add optional attributes that have been provided
-  const optionalAttrs = Object.entries(schema.attributes)
-    .filter(([_, attr]) => !attr.required)
-    .filter(([name]) => name in attributes);
-    
-  if (optionalAttrs.length > 0) {
-    config += '\n  # Optional attributes\n';
-    
-    for (const [name, attr] of optionalAttrs) {
-      const value = getAttributeValue(name, attr, attributes);
-      if (value !== null) {
-        config += `  ${name} = ${value}\n`;
-      }
-    }
-  }
-  
-  // Add tags if they exist
-  if (attributes.tags && typeof attributes.tags === 'object') {
-    config += '\n  tags = {\n';
-    for (const [key, value] of Object.entries(attributes.tags)) {
-      config += `    ${key} = "${value}"\n`;
-    }
-    config += '  }\n';
-  }
-  
-  config += `}\n`;
-  
-  return config;
-}
-
-/**
- * Get the formatted value for an attribute
- */
-function getAttributeValue(
-  name: string,
-  attr: SchemaAttribute,
-  attributes: Record<string, any>
-): string | null {
-  // If the value is explicitly provided, use it
-  if (name in attributes) {
-    const value = attributes[name];
-    
-    // Format the value based on its type
-    if (typeof value === 'string') {
-      return `"${value}"`;
-    } else if (typeof value === 'number') {
-      return value.toString();
-    } else if (typeof value === 'boolean') {
-      return value.toString();
-    } else if (Array.isArray(value)) {
-      return formatArray(value);
-    } else if (typeof value === 'object' && value !== null && name !== 'tags') {
-      return formatObject(value);
-    }
-    
-    return `"${value}"`;
-  }
-  
-  // Provide reasonable defaults based on attribute name and context
-  switch (name) {
-    case 'name':
-      return `"example-resource"`;
-    case 'ami':
-      return `"ami-12345678"`;
-    case 'instance_type':
-      return `"t2.micro"`;
-    case 'bucket':
-      return `"example-terraform-bucket"`;
-    case 'acl':
-      return `"private"`;
-    case 'zone':
-      return `"us-central1-a"`;
-    case 'machine_type':
-      return `"e2-medium"`;
-    default:
-      // For other required attributes, provide a placeholder
-      if (attr.required) {
-        // Different defaults based on typical attribute types
-        if (name.includes('id')) {
-          return `"example-id"`;
-        } else if (name.includes('arn')) {
-          return `"arn:aws:example:region:account-id:resource/example"`;
-        } else if (name.includes('type')) {
-          return `"standard"`;
+    // If no attributes were extracted, add a generic fallback schema
+    if (Object.keys(schema.attributes).length === 0) {
+      console.error(`No schema attributes found for ${provider}_${resource}, using generic schema`);
+      
+      // Add a name attribute as a generic fallback
+      schema.attributes = {
+        name: {
+          description: `The name of the ${resource}`,
+          required: true,
+          type: "string"
         }
-        
-        return `"TODO: required-value-for-${name}"`;
+      };
+      
+      // Add likely common attributes based on resource name pattern recognition
+      if (resource.includes('bucket') || resource.includes('storage')) {
+        schema.attributes.location = {
+          description: "The location/region for the resource",
+          required: true,
+          type: "string"
+        };
       }
       
-      // Skip optional attributes if not provided
-      return null;
-  }
-}
-
-/**
- * Format an array value
- */
-function formatArray(array: any[]): string {
-  if (array.length === 0) {
-    return '[]';
-  }
-  
-  const items = array.map(item => {
-    if (typeof item === 'string') {
-      return `"${item}"`;
-    } else if (typeof item === 'number') {
-      return item.toString();
-    } else if (typeof item === 'boolean') {
-      return item.toString();
-    } else if (typeof item === 'object' && item !== null) {
-      return formatObject(item);
+      if (resource.includes('instance') || resource.includes('vm') || resource.includes('machine')) {
+        schema.attributes.size = {
+          description: "The size/type of the virtual machine",
+          required: true,
+          type: "string"
+        };
+        schema.attributes.location = {
+          description: "The location/region for the resource",
+          required: true,
+          type: "string"
+        };
+      }
+      
+      // Always add tags as a common attribute
+      schema.attributes.tags = {
+        description: "Tags to assign to the resource",
+        required: false,
+        type: "map"
+      };
     }
-    return `"${item}"`;
-  });
-  
-  return `[\n    ${items.join(',\n    ')}\n  ]`;
-}
-
-/**
- * Format an object value
- */
-function formatObject(obj: Record<string, any>): string {
-  if (Object.keys(obj).length === 0) {
-    return '{}';
+    
+    return schema;
+  } catch (error: any) {
+    console.error("Error fetching resource schema:", error);
+    
+    // Return a minimal generic schema on error
+    return {
+      attributes: {
+        name: {
+          description: `Name for the ${resource}`,
+          required: true,
+          type: "string"
+        }
+      }
+    };
   }
-  
-  const entries = Object.entries(obj).map(([key, value]) => {
-    if (typeof value === 'string') {
-      return `    ${key} = "${value}"`;
-    } else if (typeof value === 'number') {
-      return `    ${key} = ${value}`;
-    } else if (typeof value === 'boolean') {
-      return `    ${key} = ${value}`;
-    } else if (Array.isArray(value)) {
-      return `    ${key} = ${formatArray(value)}`;
-    } else if (typeof value === 'object' && value !== null) {
-      return `    ${key} = ${formatObject(value)}`;
-    }
-    return `    ${key} = "${value}"`;
-  });
-  
-  return `{\n${entries.join('\n')}\n  }`;
 }
 
 // Create a stdio server for MCP
-const transport = new StdioServerTransport();
-server.connect(transport).then(() => {
-  console.error("MCP Server started successfully!");
-}).catch((error: any) => {
+function createStdioServer(server: Server) {
+  const transport = new StdioServerTransport();
+  
+  return {
+    async start() {
+      await server.connect(transport);
+      console.error("MCP Server started successfully!");
+    }
+  };
+}
+
+const stdioServer = createStdioServer(server);
+stdioServer.start().catch((error: any) => {
   console.error("Error starting server:", error);
   process.exit(1);
 });

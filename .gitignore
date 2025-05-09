@@ -88,3 +88,4 @@ terraform.tfvars.json
 *.auto.tfvars
 *.auto.tfvars.json
 claude_desktop_config.json
+mcp.json
