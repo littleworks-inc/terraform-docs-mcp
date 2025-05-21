@@ -3,7 +3,18 @@
  * Provides robust extraction of Terraform resource schemas from provider repositories
  */
 import * as https from 'https';
+import { config } from './config.js';
+import { githubApiCache, githubContentCache } from './cache.js';
+import { githubRateLimiter } from './rate-limiter.js';
 import { GitHubApiError } from './errors.js';
+
+// Define types for HTTP request options
+interface RequestOptions {
+  hostname: string;
+  path: string;
+  method: string;
+  headers: Record<string, string>;
+}
 
 /**
  * Interface for GitHub repository information
@@ -184,90 +195,202 @@ const PROVIDER_REPOS: Record<string, GitHubRepo> = {
 /**
  * HTTP request function for GitHub API
  */
-export function githubApiGet(path: string): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: 'api.github.com',
-      path: path,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'terraform-docs-mcp',
-        'Accept': 'application/vnd.github.v3+json'
-      }
-    };
-
-    https.get(options, (res) => {
-      let data = '';
-      
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      
-      res.on('end', () => {
-        try {
-          // Check for error status codes
-          if (res.statusCode && res.statusCode >= 400) {
-            const parsedError = JSON.parse(data);
-            reject(new GitHubApiError(
-              parsedError.message || 'Unknown GitHub API error',
-              path,
-              res.statusCode
-            ));
-            return;
+export async function githubApiGet(path: string): Promise<any> {
+  // Check cache first
+  const cacheKey = `api-${path}`;
+  const cachedData = githubApiCache.get(cacheKey);
+  if (cachedData) {
+    return cachedData;
+  }
+  
+  // Acquire rate limit permit
+  await githubRateLimiter.acquire();
+  
+  let retries = 0;
+  
+  while (retries <= config.github.maxRetries) {
+    try {
+      const result = await new Promise<any>((resolve, reject) => {
+        // Properly type the options object
+        const options: RequestOptions = {
+          hostname: 'api.github.com',
+          path: path,
+          method: 'GET',
+          headers: {
+            'User-Agent': 'terraform-docs-mcp',
+            'Accept': 'application/vnd.github.v3+json'
           }
-          
-          const parsedData = JSON.parse(data);
-          resolve(parsedData);
-        } catch (error) {
-          reject(new GitHubApiError(
-            `Failed to parse GitHub API response: ${error instanceof Error ? error.message : 'Unknown error'}`,
-            path
-          ));
+        };
+        
+        // Add authentication if configured
+        if (config.github.useAuth && config.github.token) {
+          options.headers['Authorization'] = `token ${config.github.token}`;
         }
+        
+        https.get(options, (res) => {
+          let data = '';
+          
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
+          
+          res.on('end', () => {
+            try {
+              // Check for rate limit headers
+              const remainingRequests = res.headers['x-ratelimit-remaining'];
+              if (remainingRequests && parseInt(remainingRequests as string, 10) === 0) {
+                const resetTime = res.headers['x-ratelimit-reset'];
+                if (resetTime) {
+                  const resetTimestamp = parseInt(resetTime as string, 10) * 1000;
+                  const waitTime = resetTimestamp - Date.now();
+                  console.error(`GitHub API rate limit exceeded. Resets in ${Math.ceil(waitTime / 1000)} seconds.`);
+                }
+              }
+              
+              // Check for error status codes
+              if (res.statusCode && res.statusCode >= 400) {
+                // Special handling for rate limiting
+                if (res.statusCode === 403 && res.headers['x-ratelimit-remaining'] === '0') {
+                  reject(new GitHubApiError('GitHub API rate limit exceeded', path, res.statusCode));
+                  return;
+                }
+                
+                // Handle other errors
+                try {
+                  const parsedError = JSON.parse(data);
+                  reject(new GitHubApiError(
+                    parsedError.message || 'Unknown GitHub API error',
+                    path,
+                    res.statusCode
+                  ));
+                } catch (parseError) {
+                  reject(new GitHubApiError(`HTTP Error: ${res.statusCode}`, path, res.statusCode));
+                }
+                return;
+              }
+              
+              const parsedData = JSON.parse(data);
+              
+              // Cache successful responses
+              githubApiCache.set(cacheKey, parsedData);
+              
+              resolve(parsedData);
+            } catch (error) {
+              reject(new GitHubApiError(
+                `Failed to parse GitHub API response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                path
+              ));
+            }
+          });
+        }).on('error', (err) => {
+          reject(new GitHubApiError(`Network error: ${err.message}`, path));
+        });
       });
-    }).on('error', (err) => {
-      reject(new GitHubApiError(`Network error: ${err.message}`, path));
-    });
-  });
+      
+      return result;
+    } catch (error) {
+      // Determine if we should retry
+      if (
+        error instanceof GitHubApiError && 
+        error.statusCode && 
+        [429, 500, 502, 503, 504].includes(error.statusCode) &&
+        retries < config.github.maxRetries
+      ) {
+        // Exponential backoff
+        const delay = Math.pow(2, retries) * config.github.retryDelay;
+        console.error(`Retrying GitHub API request in ${delay}ms (attempt ${retries + 1}/${config.github.maxRetries})...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        retries++;
+      } else {
+        throw error;
+      }
+    }
+  }
+  
+  throw new GitHubApiError(`GitHub API request failed after ${config.github.maxRetries} retries`, path);
 }
 
 /**
  * HTTP request function for raw GitHub content
  */
-export function githubRawGet(owner: string, repo: string, branch: string, path: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const fullPath = `/${owner}/${repo}/${branch}/${path}`;
-    const options = {
-      hostname: 'raw.githubusercontent.com',
-      path: fullPath,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'terraform-docs-mcp'
-      }
-    };
-
-    https.get(options, (res) => {
-      let data = '';
-      
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      
-      res.on('end', () => {
-        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(data);
-        } else {
-          reject(new GitHubApiError(
-            `Failed to fetch raw content`,
-            fullPath,
-            res.statusCode
-          ));
+export async function githubRawGet(owner: string, repo: string, branch: string, path: string): Promise<string> {
+  // Check cache first
+  const cacheKey = `raw-${owner}-${repo}-${branch}-${path}`;
+  const cachedData = githubContentCache.get(cacheKey);
+  if (cachedData) {
+    return cachedData;
+  }
+  
+  // Acquire rate limit permit
+  await githubRateLimiter.acquire();
+  
+  let retries = 0;
+  
+  while (retries <= config.github.maxRetries) {
+    try {
+      const result = await new Promise<string>((resolve, reject) => {
+        const fullPath = `/${owner}/${repo}/${branch}/${path}`;
+        // Properly type the options object
+        const options: RequestOptions = {
+          hostname: 'raw.githubusercontent.com',
+          path: fullPath,
+          method: 'GET',
+          headers: {
+            'User-Agent': 'terraform-docs-mcp'
+          }
+        };
+        
+        // Add authentication if configured
+        if (config.github.useAuth && config.github.token) {
+          options.headers['Authorization'] = `token ${config.github.token}`;
         }
+        
+        https.get(options, (res) => {
+          let data = '';
+          
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
+          
+          res.on('end', () => {
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              // Cache successful responses
+              githubContentCache.set(cacheKey, data);
+              resolve(data);
+            } else {
+              reject(new GitHubApiError(
+                `Failed to fetch raw content: HTTP ${res.statusCode}`,
+                fullPath,
+                res.statusCode
+              ));
+            }
+          });
+        }).on('error', (err) => {
+          reject(new GitHubApiError(`Network error: ${err.message}`, fullPath));
+        });
       });
-    }).on('error', (err) => {
-      reject(new GitHubApiError(`Network error: ${err.message}`, fullPath));
-    });
-  });
+      
+      return result;
+    } catch (error) {
+      // Determine if we should retry
+      if (
+        error instanceof GitHubApiError && 
+        error.statusCode && 
+        [429, 500, 502, 503, 504].includes(error.statusCode) &&
+        retries < config.github.maxRetries
+      ) {
+        // Exponential backoff
+        const delay = Math.pow(2, retries) * config.github.retryDelay;
+        console.error(`Retrying GitHub raw content request in ${delay}ms (attempt ${retries + 1}/${config.github.maxRetries})...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        retries++;
+      } else {
+        throw error;
+      }
+    }
+  }
+  
+  throw new GitHubApiError(`GitHub raw content request failed after ${config.github.maxRetries} retries`, `/${owner}/${repo}/${branch}/${path}`);
 }
 
 /**

@@ -30,6 +30,20 @@ import {
   ProviderNotFoundError
 } from './errors.js';
 
+import { config } from './config.js';
+
+// Log startup information
+console.error(`Starting terraform-docs-mcp with configuration:`);
+console.error(`- GitHub Auth: ${config.github.useAuth ? 'Enabled' : 'Disabled'}`);
+console.error(`- Rate Limit: ${config.github.requestsPerMinute} requests per minute`);
+console.error(`- Caching: ${config.cache.enabled ? 'Enabled' : 'Disabled'}`);
+console.error(`- Log Level: ${config.logging.level}`);
+
+if (!config.github.useAuth) {
+  console.error("WARNING: GitHub token not configured. API rate limits will be restricted.");
+  console.error("To configure a token, set the GITHUB_TOKEN environment variable.");
+}
+
 // Define TypeScript interfaces for better type safety
 interface ProviderDocsArgs {
   provider: string;
