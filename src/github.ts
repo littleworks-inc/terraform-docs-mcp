@@ -3,6 +3,7 @@
  * Provides robust extraction of Terraform resource schemas from provider repositories
  */
 import * as https from 'https';
+import { GitHubApiError } from './errors.js';
 
 /**
  * Interface for GitHub repository information
@@ -204,16 +205,28 @@ export function githubApiGet(path: string): Promise<any> {
       
       res.on('end', () => {
         try {
+          // Check for error status codes
+          if (res.statusCode && res.statusCode >= 400) {
+            const parsedError = JSON.parse(data);
+            reject(new GitHubApiError(
+              parsedError.message || 'Unknown GitHub API error',
+              path,
+              res.statusCode
+            ));
+            return;
+          }
+          
           const parsedData = JSON.parse(data);
           resolve(parsedData);
         } catch (error) {
-          // Handle parsing error with proper type annotation
-          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-          reject(new Error(`Failed to parse GitHub API response: ${errorMessage}`));
+          reject(new GitHubApiError(
+            `Failed to parse GitHub API response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            path
+          ));
         }
       });
     }).on('error', (err) => {
-      reject(err);
+      reject(new GitHubApiError(`Network error: ${err.message}`, path));
     });
   });
 }
@@ -223,9 +236,10 @@ export function githubApiGet(path: string): Promise<any> {
  */
 export function githubRawGet(owner: string, repo: string, branch: string, path: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    const fullPath = `/${owner}/${repo}/${branch}/${path}`;
     const options = {
       hostname: 'raw.githubusercontent.com',
-      path: `/${owner}/${repo}/${branch}/${path}`,
+      path: fullPath,
       method: 'GET',
       headers: {
         'User-Agent': 'terraform-docs-mcp'
@@ -243,11 +257,15 @@ export function githubRawGet(owner: string, repo: string, branch: string, path: 
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
           resolve(data);
         } else {
-          reject(new Error(`HTTP Error: ${res.statusCode} for path ${path}`));
+          reject(new GitHubApiError(
+            `Failed to fetch raw content`,
+            fullPath,
+            res.statusCode
+          ));
         }
       });
     }).on('error', (err) => {
-      reject(err);
+      reject(new GitHubApiError(`Network error: ${err.message}`, fullPath));
     });
   });
 }

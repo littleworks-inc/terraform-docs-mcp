@@ -1,3 +1,4 @@
+// src/schema-integration.ts
 /**
  * Integration between the enhanced schema extraction and configuration generator
  * This module bridges the GitHub schema extraction and the Terraform configuration generator
@@ -5,73 +6,95 @@
 
 import { fetchResourceSchemaFromGithub, SchemaAttribute as GitHubSchemaAttribute, Schema as GitHubSchema } from './github.js';
 import { generateTerraformConfig, SchemaAttribute as GeneratorSchemaAttribute, Schema as GeneratorSchema } from './generator.js';
+import { 
+  TerraformDocsError, 
+  SchemaParsingError, 
+  ConfigGenerationError, 
+  ResourceNotFoundError 
+} from './errors.js';
 
 /**
  * Convert GitHub schema to Generator schema format
  */
 export function convertGitHubSchemaToGeneratorSchema(githubSchema: GitHubSchema): GeneratorSchema {
-  const result: GeneratorSchema = {
-    attributes: {}
-  };
-  
-  // Process regular attributes
-  for (const [name, attr] of Object.entries(githubSchema.attributes)) {
-    result.attributes[name] = convertAttribute(attr);
-  }
-  
-  // Process block types
-  if (githubSchema.blockTypes) {
-    for (const [blockName, blockType] of Object.entries(githubSchema.blockTypes)) {
-      // Add block type as a complex attribute
-      const blockAttr: GeneratorSchemaAttribute = {
-        description: `Configuration block for ${blockName}`,
-        required: blockType.min_items ? blockType.min_items > 0 : false,
-        type: blockType.nesting.toLowerCase(),
-        nested: {}
-      };
-      
-      // Add nested attributes within the block
-      for (const [nestedName, nestedAttr] of Object.entries(blockType.block.attributes)) {
-        if (blockAttr.nested) {
-          blockAttr.nested[nestedName] = convertAttribute(nestedAttr);
-        }
-      }
-      
-      result.attributes[blockName] = blockAttr;
+  try {
+    const result: GeneratorSchema = {
+      attributes: {}
+    };
+    
+    // Process regular attributes
+    for (const [name, attr] of Object.entries(githubSchema.attributes)) {
+      result.attributes[name] = convertAttribute(attr);
     }
+    
+    // Process block types
+    if (githubSchema.blockTypes) {
+      for (const [blockName, blockType] of Object.entries(githubSchema.blockTypes)) {
+        // Add block type as a complex attribute
+        const blockAttr: GeneratorSchemaAttribute = {
+          description: `Configuration block for ${blockName}`,
+          required: blockType.min_items ? blockType.min_items > 0 : false,
+          type: blockType.nesting.toLowerCase(),
+          nested: {}
+        };
+        
+        // Add nested attributes within the block
+        for (const [nestedName, nestedAttr] of Object.entries(blockType.block.attributes)) {
+          if (blockAttr.nested) {
+            blockAttr.nested[nestedName] = convertAttribute(nestedAttr);
+          }
+        }
+        
+        result.attributes[blockName] = blockAttr;
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    throw new SchemaParsingError(
+      `Failed to convert GitHub schema to generator schema: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      githubSchema.providerName,
+      githubSchema.resourceName
+    );
   }
-  
-  return result;
 }
 
 /**
  * Convert individual attribute from GitHub format to Generator format
  */
 function convertAttribute(githubAttr: GitHubSchemaAttribute): GeneratorSchemaAttribute {
-  const result: GeneratorSchemaAttribute = {
-    description: githubAttr.description || "",
-    required: githubAttr.required || false
-  };
-  
-  // Copy type
-  if (githubAttr.type) {
-    result.type = githubAttr.type;
-  }
-  
-  // Handle element type for collections
-  if (githubAttr.elem) {
-    result.elem = { ...githubAttr.elem };
-  }
-  
-  // Handle nested attributes
-  if (githubAttr.nested) {
-    result.nested = {};
-    for (const [nestedName, nestedAttr] of Object.entries(githubAttr.nested)) {
-      result.nested[nestedName] = convertAttribute(nestedAttr);
+  try {
+    const result: GeneratorSchemaAttribute = {
+      description: githubAttr.description || "",
+      required: githubAttr.required || false
+    };
+    
+    // Copy type
+    if (githubAttr.type) {
+      result.type = githubAttr.type;
     }
+    
+    // Handle element type for collections
+    if (githubAttr.elem) {
+      result.elem = { ...githubAttr.elem };
+    }
+    
+    // Handle nested attributes
+    if (githubAttr.nested) {
+      result.nested = {};
+      for (const [nestedName, nestedAttr] of Object.entries(githubAttr.nested)) {
+        result.nested[nestedName] = convertAttribute(nestedAttr);
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    throw new SchemaParsingError(
+      `Failed to convert attribute: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      undefined,
+      undefined
+    );
   }
-  
-  return result;
 }
 
 /**
@@ -124,6 +147,7 @@ function generateProviderSpecificDefaults(provider: string, resource: string, sc
 
 /**
  * Fetch resource schema, convert it, and generate Terraform configuration
+ * with improved error handling
  */
 export async function fetchSchemaAndGenerateConfig(
   provider: string,
@@ -134,6 +158,11 @@ export async function fetchSchemaAndGenerateConfig(
     // Fetch schema from GitHub
     const githubSchema = await fetchResourceSchemaFromGithub(provider, resource);
     
+    // Ensure we have a valid schema
+    if (!isValidSchema(githubSchema)) {
+      throw new ResourceNotFoundError(provider, resource);
+    }
+    
     // Convert to generator schema format
     const generatorSchema = convertGitHubSchemaToGeneratorSchema(githubSchema);
     
@@ -143,15 +172,37 @@ export async function fetchSchemaAndGenerateConfig(
     // Merge provided attributes with smart defaults
     const mergedAttributes = { ...smartDefaults, ...attributes };
     
-    // Generate configuration using the enhanced generator
-    const config = generateTerraformConfig(provider, resource, generatorSchema, mergedAttributes);
+    try {
+      // Generate configuration using the enhanced generator
+      const config = generateTerraformConfig(provider, resource, generatorSchema, mergedAttributes);
+      return config;
+    } catch (genError) {
+      throw new ConfigGenerationError(
+        genError instanceof Error ? genError.message : 'Unknown error during config generation',
+        provider,
+        resource
+      );
+    }
+  } catch (error) {
+    // If it's already one of our custom errors, just re-throw it
+    if (error instanceof TerraformDocsError) {
+      throw error;
+    }
     
-    return config;
-  } catch (error: any) {
     console.error(`Error in fetchSchemaAndGenerateConfig: ${error instanceof Error ? error.message : 'Unknown error'}`);
     
     // Fallback to direct generator if schema fetch fails
-    return generateTerraformConfig(provider, resource, { attributes: {} }, attributes);
+    try {
+      console.error("Using fallback direct generation method...");
+      const config = generateTerraformConfig(provider, resource, { attributes: {} }, attributes);
+      return config;
+    } catch (fallbackError) {
+      throw new ConfigGenerationError(
+        `Fallback generation also failed: ${fallbackError instanceof Error ? fallbackError.message : 'Unknown error'}`,
+        provider,
+        resource
+      );
+    }
   }
 }
 
@@ -175,6 +226,7 @@ export function isValidSchema(schema: GitHubSchema): boolean {
 
 /**
  * Enhanced schema fetching that tries multiple strategies
+ * with improved error handling
  */
 export async function fetchEnhancedResourceSchema(
   provider: string, 
@@ -194,6 +246,8 @@ export async function fetchEnhancedResourceSchema(
     if (isValidSchema(githubSchema)) {
       return convertGitHubSchemaToGeneratorSchema(githubSchema);
     } else {
+      console.error(`Schema for ${provider}_${resource} is not valid or incomplete, using fallback`);
+      
       // Fallback to registry lookup or basic schema
       const basicSchema = createBasicSchema(provider, resource);
       
@@ -205,9 +259,24 @@ export async function fetchEnhancedResourceSchema(
         }
       };
     }
-  } catch (error: any) {
+  } catch (error) {
     console.error(`Error fetching enhanced schema: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    return createBasicSchema(provider, resource);
+    
+    // If it's already one of our custom errors, include more context before re-throwing
+    if (error instanceof TerraformDocsError) {
+      // Add more context if missing
+      if (error instanceof SchemaParsingError && !error.provider) {
+        throw new SchemaParsingError(error.message, provider, resource);
+      }
+      throw error;
+    }
+    
+    // Create a new error with proper context
+    throw new SchemaParsingError(
+      `Failed to fetch enhanced resource schema: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      provider,
+      resource
+    );
   }
 }
 

@@ -21,6 +21,15 @@ import {
   isValidSchema
 } from './schema-integration.js';
 
+import { 
+  TerraformDocsError, 
+  GitHubApiError, 
+  SchemaParsingError, 
+  ConfigGenerationError,
+  ResourceNotFoundError,
+  ProviderNotFoundError
+} from './errors.js';
+
 // Define TypeScript interfaces for better type safety
 interface ProviderDocsArgs {
   provider: string;
@@ -189,18 +198,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
     else {
       return {
         error: {
-          message: `Unknown tool: ${request.params.name}`
+          message: `Unknown tool: ${request.params.name}`,
+          type: 'UnknownToolError'
         }
       };
     }
     
     console.error(`Tool response: ${JSON.stringify(response)}`);
     return response;
-  } catch (error: any) {
+  } catch (error) {
     console.error("Error executing tool:", error);
+    
+    // Format error response based on error type
+    if (error instanceof TerraformDocsError) {
+      return {
+        error: {
+          message: error.message,
+          type: error.name,
+          // Include additional context if available
+          details: {
+            provider: (error as any).provider,
+            resource: (error as any).resource,
+            path: (error as any).path,
+            statusCode: (error as any).statusCode
+          }
+        }
+      };
+    }
+    
+    // Generic error handling
     return {
       error: {
-        message: `Error executing tool: ${error.message}`
+        message: `Unexpected error: ${error instanceof Error ? error.message : String(error)}`,
+        type: 'UnexpectedError'
       }
     };
   }
@@ -267,6 +297,11 @@ async function fetchProviderDocs(args: ProviderDocsArgs) {
   const { provider, resource, useGithub = false } = args;
   
   try {
+    // Validate provider
+    if (!provider || provider.trim() === '') {
+      throw new ProviderNotFoundError('Provider name cannot be empty');
+    }
+    
     let registryUrl = `https://registry.terraform.io/providers/hashicorp/${provider}/latest/docs`;
     
     if (resource) {
@@ -275,49 +310,74 @@ async function fetchProviderDocs(args: ProviderDocsArgs) {
     
     console.error(`Fetching documentation from: ${registryUrl}`);
     
-    // Get Registry documentation
-    const html = await httpGet(registryUrl);
-    const docs = extractText(html, 'main-content');
-    const registryExamples = extractExamples(html);
-    
-    let result: {
-      documentation: string;
-      examples: string[];
-      url: string;
-      sources: string[];
-      githubRepo?: string;
-    } = {
-      documentation: docs || "Documentation content could not be extracted",
-      examples: registryExamples,
-      url: registryUrl,
-      sources: ["Terraform Registry"]
-    };
-    
-    // If GitHub integration is enabled, fetch additional examples
-    if (useGithub && resource) {
-      console.error(`Fetching GitHub examples for: ${provider}_${resource}`);
-      const githubExamples = await fetchResourceExamples(provider, resource);
+    try {
+      // Get Registry documentation
+      const html = await httpGet(registryUrl);
+      const docs = extractText(html, 'main-content');
+      const registryExamples = extractExamples(html);
       
-      if (githubExamples.length > 0) {
-        result.examples = [...registryExamples, ...githubExamples];
-        result.sources = [...result.sources, "GitHub"];
+      if (!docs || docs.trim() === '') {
+        throw new ResourceNotFoundError(provider, resource || 'provider documentation');
       }
       
-      // Get GitHub repository info
-      const repo = await getRepoOrDiscover(provider);
-      if (repo) {
-        result.githubRepo = `https://github.com/${repo.owner}/${repo.name}`;
+      let result: {
+        documentation: string;
+        examples: string[];
+        url: string;
+        sources: string[];
+        githubRepo?: string;
+      } = {
+        documentation: docs,
+        examples: registryExamples,
+        url: registryUrl,
+        sources: ["Terraform Registry"]
+      };
+      
+      // If GitHub integration is enabled, fetch additional examples
+      if (useGithub && resource) {
+        try {
+          console.error(`Fetching GitHub examples for: ${provider}_${resource}`);
+          const githubExamples = await fetchResourceExamples(provider, resource);
+          
+          if (githubExamples.length > 0) {
+            result.examples = [...registryExamples, ...githubExamples];
+            result.sources = [...result.sources, "GitHub"];
+          }
+          
+          // Get GitHub repository info
+          const repo = await getRepoOrDiscover(provider);
+          if (repo) {
+            result.githubRepo = `https://github.com/${repo.owner}/${repo.name}`;
+          }
+        } catch (githubError) {
+          // Log but don't fail - GitHub integration is optional
+          console.error(`GitHub integration failed: ${githubError instanceof Error ? githubError.message : 'Unknown error'}`);
+        }
       }
+      
+      return { result };
+    } catch (error) {
+      if (error instanceof ResourceNotFoundError) {
+        throw error;
+      }
+      
+      throw new SchemaParsingError(
+        `Failed to fetch documentation: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        provider,
+        resource || undefined
+      );
+    }
+  } catch (error) {
+    if (error instanceof TerraformDocsError) {
+      throw error;
     }
     
-    return { result };
-  } catch (error: any) {
     console.error("Error fetching provider docs:", error);
-    return {
-      error: {
-        message: `Failed to fetch provider documentation: ${error.message}`
-      }
-    };
+    throw new SchemaParsingError(
+      `Failed to fetch provider documentation: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      provider,
+      resource || undefined
+    );
   }
 }
 

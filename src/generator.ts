@@ -3,6 +3,8 @@
  * Provides more complete, best-practice Terraform configurations with better structure and comments
  */
 
+import { ConfigGenerationError } from './errors.js';
+
 export interface SchemaAttribute {
   description: string;
   required: boolean;
@@ -31,62 +33,70 @@ export function generateTerraformConfig(
   schema: Schema,
   attributes: Record<string, any> = {}
 ): string {
-  // Format the resource name to match Terraform convention
-  const resourceType = `${provider}_${resource}`;
-  const resourceName = formatResourceName(resource);
-  
-  // Start building the configuration with header comments
-  let config = `# Terraform configuration for ${resourceType}\n`;
-  config += `# Generated with terraform-docs-mcp\n\n`;
-  
-  // Add terraform block with required providers
-  config += generateTerraformBlock(provider);
-  
-  // Add provider block with best practice configuration
-  config += generateProviderBlock(provider, attributes);
-  
-  // Add locals block if needed for this resource type
-  const localsBlock = generateLocalsBlock(provider, resource, attributes);
-  if (localsBlock) {
-    config += localsBlock;
+  try {
+    // Format the resource name to match Terraform convention
+    const resourceType = `${provider}_${resource}`;
+    const resourceName = formatResourceName(resource);
+    
+    // Start building the configuration with header comments
+    let config = `# Terraform configuration for ${resourceType}\n`;
+    config += `# Generated with terraform-docs-mcp\n\n`;
+    
+    // Add terraform block with required providers
+    config += generateTerraformBlock(provider);
+    
+    // Add provider block with best practice configuration
+    config += generateProviderBlock(provider, attributes);
+    
+    // Add locals block if needed for this resource type
+    const localsBlock = generateLocalsBlock(provider, resource, attributes);
+    if (localsBlock) {
+      config += localsBlock;
+    }
+    
+    // Add resource block
+    config += `resource "${resourceType}" "${resourceName}" {\n`;
+    
+    // Extract and organize blocks and attributes
+    const { simpleAttributes, blockAttributes } = categorizeAttributes(schema.attributes, attributes);
+    
+    // Add resource attributes based on schema and provided values
+    const attributeLines = formatAttributes(simpleAttributes, attributes);
+    config += attributeLines;
+    
+    // Add block attributes (nested blocks)
+    if (Object.keys(blockAttributes).length > 0) {
+      config += formatBlockAttributes(blockAttributes, attributes);
+    }
+    
+    // Add lifecycle block if appropriate
+    const lifecycleBlock = generateLifecycleBlock(provider, resource);
+    if (lifecycleBlock) {
+      config += lifecycleBlock;
+    }
+    
+    // Add depends_on if needed
+    const dependsOnBlock = generateDependsOnBlock(provider, resource, attributes);
+    if (dependsOnBlock) {
+      config += dependsOnBlock;
+    }
+    
+    config += `}\n\n`;
+    
+    // Add outputs section if appropriate
+    const outputs = generateOutputs(provider, resource, resourceName);
+    if (outputs) {
+      config += outputs;
+    }
+    
+    return config;
+  } catch (error) {
+    throw new ConfigGenerationError(
+      `Failed to generate Terraform configuration: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      provider,
+      resource
+    );
   }
-  
-  // Add resource block
-  config += `resource "${resourceType}" "${resourceName}" {\n`;
-  
-  // Extract and organize blocks and attributes
-  const { simpleAttributes, blockAttributes } = categorizeAttributes(schema.attributes, attributes);
-  
-  // Add resource attributes based on schema and provided values
-  const attributeLines = formatAttributes(simpleAttributes, attributes);
-  config += attributeLines;
-  
-  // Add block attributes (nested blocks)
-  if (Object.keys(blockAttributes).length > 0) {
-    config += formatBlockAttributes(blockAttributes, attributes);
-  }
-  
-  // Add lifecycle block if appropriate
-  const lifecycleBlock = generateLifecycleBlock(provider, resource);
-  if (lifecycleBlock) {
-    config += lifecycleBlock;
-  }
-  
-  // Add depends_on if needed
-  const dependsOnBlock = generateDependsOnBlock(provider, resource, attributes);
-  if (dependsOnBlock) {
-    config += dependsOnBlock;
-  }
-  
-  config += `}\n\n`;
-  
-  // Add outputs section if appropriate
-  const outputs = generateOutputs(provider, resource, resourceName);
-  if (outputs) {
-    config += outputs;
-  }
-  
-  return config;
 }
 
 /**
