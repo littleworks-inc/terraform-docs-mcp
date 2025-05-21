@@ -1,5 +1,8 @@
-// src/cache.ts
-import { config } from './config.js';
+// src/utils/cache.ts
+import { config } from '../config/index.js';
+import { Logger } from './logger.js';
+
+const logger = new Logger('Cache');
 
 /**
  * A simple in-memory cache implementation
@@ -18,14 +21,19 @@ export class Cache<T> {
     if (!config.cache.enabled) return undefined;
     
     const item = this.cache.get(key);
-    if (!item) return undefined;
+    if (!item) {
+      logger.debug(`Cache miss: ${key}`);
+      return undefined;
+    }
     
     // Check if the item has expired
     if (Date.now() - item.timestamp > this.ttl) {
+      logger.debug(`Cache expired: ${key}`);
       this.cache.delete(key);
       return undefined;
     }
     
+    logger.debug(`Cache hit: ${key}`);
     return item.value;
   }
   
@@ -41,10 +49,12 @@ export class Cache<T> {
     if (this.cache.size >= this.maxSize) {
       const oldestEntry = this.getOldestEntry();
       if (oldestEntry) {
+        logger.debug(`Cache full, removing oldest entry: ${oldestEntry[0]}`);
         this.cache.delete(oldestEntry[0]); // Delete by key
       }
     }
     
+    logger.debug(`Cache set: ${key}`);
     this.cache.set(key, { value, timestamp: Date.now() });
   }
   
@@ -112,6 +122,7 @@ export class Cache<T> {
    * Clear the cache
    */
   clear(): void {
+    logger.debug(`Cache cleared, ${this.cache.size} entries removed`);
     this.cache.clear();
   }
   

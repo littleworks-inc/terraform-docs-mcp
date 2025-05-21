@@ -1,5 +1,8 @@
-// src/rate-limiter.ts
-import { config } from './config.js';
+// src/utils/rateLimiter.ts
+import { config } from '../config/index.js';
+import { Logger } from './logger.js';
+
+const logger = new Logger('RateLimiter');
 
 /**
  * Simple rate limiter to control API request rates
@@ -62,6 +65,7 @@ export class RateLimiter {
       const oldestTimestamp = this.requestTimestamps[0];
       const timeToWait = Math.max(60000 - (now - oldestTimestamp), 0);
       
+      logger.warn(`Rate limit reached. Waiting ${timeToWait}ms before next request. Queue size: ${this.requestQueue.length}`);
       setTimeout(() => this.processQueue(), timeToWait);
     }
   }

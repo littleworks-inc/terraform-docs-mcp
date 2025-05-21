@@ -1,4 +1,8 @@
-// src/errors.ts
+// src/errors/index.ts
+/**
+ * Application error types
+ */
+
 /**
  * Base error class for the application
  */
