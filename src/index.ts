@@ -29,6 +29,14 @@ import {
 import { Logger } from './utils/logger.js';
 import { cacheService } from './services/index.js';
 
+import { 
+  convertStateToModule, 
+  extractFromState, 
+  extractFromHcl, 
+  ConversionConfig, 
+  ExtractionOptions
+} from './converter.js';
+
 const logger = new Logger('Main');
 
 // Log startup information
@@ -145,7 +153,51 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["provider"]
         }
-      }
+      },
+      {
+        name: "terraform_state_to_module",
+        description: "Convert Terraform state or configuration to a reusable module",
+        inputSchema: {
+          type: "object",
+          properties: {
+            moduleName: { 
+              type: "string", 
+              description: "The name of the module to create", 
+            },
+            description: { 
+              type: "string", 
+              description: "Description of what the module does", 
+            },
+            stateContent: { 
+              type: "string", 
+              description: "JSON content of a Terraform state file", 
+            },
+            hclContent: { 
+              type: "string", 
+              description: "HCL content of Terraform configuration files", 
+            },
+            parameterizeNames: { 
+              type: "array", 
+              items: { type: "string" },
+              description: "List of resource names to parameterize", 
+            },
+            parameterizeCommonAttributes: { 
+              type: "boolean", 
+              description: "Whether to automatically parameterize common attributes", 
+            },
+            redactSensitiveValues: { 
+              type: "boolean", 
+              description: "Whether to redact sensitive values", 
+            },
+            excludeAttributes: { 
+              type: "array", 
+              items: { type: "string" },
+              description: "List of attributes to exclude", 
+            }
+          },
+          required: ["moduleName", "description"]
+        }
+      },
     ]
   };
 });
@@ -168,6 +220,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
     }
     else if (request.params.name === "terraform_github_info") {
       response = await fetchGithubInfo(request.params.arguments as GithubInfoArgs);
+    }
+    else if (request.params.name === "terraform_state_to_module") {
+      response = await convertStateToModuleHandler(request.params.arguments);
     }
     else {
       return {
@@ -246,3 +301,108 @@ stdioServer.start().catch((error: any) => {
   logger.error("Error starting server", error);
   process.exit(1);
 });
+
+/**
+ * Convert Terraform state to a module
+ */
+async function convertStateToModuleHandler(args: any) {
+  const { 
+    moduleName, 
+    description, 
+    stateContent, 
+    hclContent,
+    parameterizeNames = [],
+    parameterizeCommonAttributes = true,
+    redactSensitiveValues = true,
+    excludeAttributes = []
+  } = args;
+  
+  try {
+    console.error(`Converting state/HCL to module: ${moduleName}`);
+    
+    let resources = [];
+    let providers = [];
+    
+    // Extract configuration from state if provided
+    if (stateContent) {
+      console.error('Extracting from state content');
+      const extractionOptions: ExtractionOptions = {
+        redactSensitiveValues,
+        excludeAttributes,
+        extractResources: true,
+        extractDataSources: true,
+        extractProviders: true
+      };
+      
+      const extracted = extractFromState(stateContent, extractionOptions);
+      resources = extracted.resources;
+      providers = extracted.providers;
+    }
+    // Or extract from HCL if provided
+    else if (hclContent) {
+      console.error('Extracting from HCL content');
+      const extractionOptions: ExtractionOptions = {
+        redactSensitiveValues,
+        excludeAttributes,
+        extractResources: true,
+        extractDataSources: true,
+        extractProviders: true
+      };
+      
+      const extracted = extractFromHcl(hclContent, extractionOptions);
+      resources = extracted.resources;
+      providers = extracted.providers;
+    }
+    // If neither is provided, return an error
+    else {
+      return {
+        error: {
+          message: "Either stateContent or hclContent must be provided"
+        }
+      };
+    }
+    
+    // Ensure we have resources to convert
+    if (resources.length === 0) {
+      return {
+        error: {
+          message: "No resources found in the provided content"
+        }
+      };
+    }
+    
+    // Create conversion config
+    const conversionConfig: ConversionConfig = {
+      moduleName,
+      description,
+      resources,
+      parameterizeNames,
+      parameterizeCommonAttributes,
+      providerRequirements: providers
+    };
+    
+    // Convert state to module
+    const moduleFiles = convertStateToModule(conversionConfig);
+    
+    // Prepare the result - format files for response
+    const result = {
+      moduleName,
+      description,
+      files: Object.entries(moduleFiles).map(([filename, content]) => ({
+        name: filename,
+        content
+      })),
+      resourceCount: resources.length,
+      providerCount: providers.length
+    };
+    
+    return { result };
+  } catch (error: any) {
+    console.error("Error converting state to module:", error);
+    return {
+      error: {
+        message: `Failed to convert state to module: ${error.message}`
+      }
+    };
+  }
+}
