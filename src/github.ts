@@ -1,11 +1,8 @@
 /**
- * Enhanced GitHub schema extraction module with rate limiting and caching
+ * Enhanced GitHub schema extraction module
  * Provides robust extraction of Terraform resource schemas from provider repositories
  */
-import { httpClient, HttpClient, HttpError } from './services/http-client.js';
-import { CacheService, CACHE_TTL } from './services/cache.js';
-import { RateLimiter } from './services/rate-limiter.js';
-import { getConfig, PROVIDER_REPOS } from './config/index.js';
+import * as https from 'https';
 
 /**
  * Interface for GitHub repository information
@@ -14,7 +11,6 @@ export interface GitHubRepo {
   owner: string;
   name: string;
   defaultBranch: string;
-  schemaPatterns?: string[];
 }
 
 /**
@@ -58,308 +54,373 @@ export interface Schema {
 }
 
 /**
- * Enhanced GitHub service with rate limiting and caching
+ * Map of known Terraform provider repositories
+ * Maps provider name to its GitHub repository information
  */
-export class GitHubService {
-  private cache: CacheService;
-  private rateLimiter: RateLimiter;
-  private config = getConfig();
-
-  constructor() {
-    this.cache = new CacheService({
-      maxSize: this.config.cache.maxSize,
-      defaultTtl: this.config.cache.defaultTtl,
-      cleanupInterval: this.config.cache.cleanupInterval
-    });
-    
-    this.rateLimiter = new RateLimiter();
+const PROVIDER_REPOS: Record<string, GitHubRepo> = {
+  'aws': { 
+    owner: 'hashicorp', 
+    name: 'terraform-provider-aws',
+    defaultBranch: 'main'
+  },
+  'azurerm': { 
+    owner: 'hashicorp', 
+    name: 'terraform-provider-azurerm',
+    defaultBranch: 'main'
+  },
+  'azure': { 
+    owner: 'hashicorp', 
+    name: 'terraform-provider-azurerm',
+    defaultBranch: 'main'
+  },
+  'azuread': { 
+    owner: 'hashicorp', 
+    name: 'terraform-provider-azuread',
+    defaultBranch: 'main'
+  },
+  'google': { 
+    owner: 'hashicorp', 
+    name: 'terraform-provider-google',
+    defaultBranch: 'main'
+  },
+  'gcp': { 
+    owner: 'hashicorp', 
+    name: 'terraform-provider-google',
+    defaultBranch: 'main'
+  },
+  'kubernetes': { 
+    owner: 'hashicorp', 
+    name: 'terraform-provider-kubernetes',
+    defaultBranch: 'main'
+  },
+  'oci': { 
+    owner: 'oracle', 
+    name: 'terraform-provider-oci',
+    defaultBranch: 'master'
+  },
+  'docker': { 
+    owner: 'kreuzwerker', 
+    name: 'terraform-provider-docker',
+    defaultBranch: 'main'
+  },
+  'github': {
+    owner: 'integrations',
+    name: 'terraform-provider-github',
+    defaultBranch: 'main'
+  },
+  'datadog': {
+    owner: 'DataDog',
+    name: 'terraform-provider-datadog',
+    defaultBranch: 'main'
+  },
+  'digitalocean': {
+    owner: 'digitalocean',
+    name: 'terraform-provider-digitalocean',
+    defaultBranch: 'main'
+  },
+  'tfe': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-tfe',
+    defaultBranch: 'main'
+  },
+  'helm': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-helm',
+    defaultBranch: 'main'
+  },
+  'vault': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-vault',
+    defaultBranch: 'main'
+  },
+  'alicloud': {
+    owner: 'aliyun',
+    name: 'terraform-provider-alicloud',
+    defaultBranch: 'master'
+  },
+  'consul': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-consul',
+    defaultBranch: 'main'
+  },
+  'random': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-random',
+    defaultBranch: 'main'
+  },
+  'time': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-time',
+    defaultBranch: 'main'
+  },
+  'template': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-template',
+    defaultBranch: 'main'
+  },
+  'null': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-null',
+    defaultBranch: 'main'
+  },
+  'local': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-local',
+    defaultBranch: 'main'
+  },
+  'cloudinit': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-cloudinit',
+    defaultBranch: 'main'
+  },
+  'external': {
+    owner: 'hashicorp',
+    name: 'terraform-provider-external',
+    defaultBranch: 'main'
   }
+};
 
-  /**
-   * GitHub API request with rate limiting and caching
-   */
-  async githubApiGet(path: string): Promise<any> {
-    const cacheKey = CacheService.generateKey('github-api', path);
-    
-    // Try cache first
-    const cached = await this.cache.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    // Apply rate limiting
-    await this.rateLimiter.throttle();
-
-    try {
-      const url = `${this.config.github.apiUrl}${path}`;
-      const response = await httpClient.get(url);
-      
-      const data = HttpClient.parseJson(response);
-      
-      // Cache successful responses
-      await this.cache.set(cacheKey, data, CACHE_TTL.REPO_INFO);
-      
-      return data;
-    } catch (error) {
-      if (error instanceof HttpError) {
-        // Cache 404 errors briefly to avoid repeated requests
-        if (error.statusCode === 404) {
-          await this.cache.set(cacheKey, null, CACHE_TTL.ERROR_RESPONSE);
-        }
-        throw error;
+/**
+ * HTTP request function for GitHub API
+ */
+export function githubApiGet(path: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.github.com',
+      path: path,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'terraform-docs-mcp',
+        'Accept': 'application/vnd.github.v3+json'
       }
-      throw error;
-    }
-  }
+    };
 
-  /**
-   * GitHub raw content request with rate limiting and caching
-   */
-  async githubRawGet(owner: string, repo: string, branch: string, path: string): Promise<string> {
-    const cacheKey = CacheService.generateKey('github-raw', owner, repo, branch, path);
-    
-    // Try cache first
-    const cached = await this.cache.get<string>(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    // Apply rate limiting
-    await this.rateLimiter.throttle();
-
-    try {
-      const url = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`;
-      const response = await httpClient.get(url);
+    https.get(options, (res) => {
+      let data = '';
       
-      // Cache successful responses
-      await this.cache.set(cacheKey, response.body, CACHE_TTL.SCHEMA);
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
       
-      return response.body;
-    } catch (error) {
-      if (error instanceof HttpError) {
-        // Cache 404 errors briefly
-        if (error.statusCode === 404) {
-          await this.cache.set(cacheKey, '', CACHE_TTL.ERROR_RESPONSE);
-        }
-        throw error;
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Get GitHub repository information for a provider
-   */
-  getProviderRepo(provider: string): GitHubRepo | null {
-    const normalizedProvider = this.config.getNormalizedProvider(provider);
-    return PROVIDER_REPOS[normalizedProvider as keyof typeof PROVIDER_REPOS] || null;
-  }
-
-  /**
-   * Dynamically discover the GitHub repository for a provider with caching
-   */
-  async discoverProviderRepo(provider: string): Promise<GitHubRepo | null> {
-    const cacheKey = CacheService.generateKey('repo-discovery', provider);
-    
-    // Try cache first
-    const cached = await this.cache.get<GitHubRepo | null>(cacheKey);
-    if (cached !== undefined) {
-      return cached;
-    }
-
-    try {
-      const searchRes = await this.githubApiGet(
-        `/search/repositories?q=terraform-provider-${provider}+in:name&sort=stars&order=desc`
-      );
-      
-      if (searchRes?.items && searchRes.items.length > 0) {
-        const topRepo = searchRes.items[0];
-        const repo: GitHubRepo = {
-          owner: topRepo.owner.login,
-          name: topRepo.name,
-          defaultBranch: topRepo.default_branch
-        };
-        
-        // Cache the discovery result
-        await this.cache.set(cacheKey, repo, CACHE_TTL.REPO_INFO);
-        return repo;
-      }
-      
-      // Cache null result to avoid repeated failed searches
-      await this.cache.set(cacheKey, null, CACHE_TTL.ERROR_RESPONSE);
-      return null;
-    } catch (error) {
-      console.error(`Failed to discover GitHub repository for provider: ${provider}`, error);
-      
-      // Cache null result for failed searches
-      await this.cache.set(cacheKey, null, CACHE_TTL.ERROR_RESPONSE);
-      return null;
-    }
-  }
-
-  /**
-   * Get repository information from static mapping or discover dynamically
-   */
-  async getRepoOrDiscover(provider: string): Promise<GitHubRepo | null> {
-    const staticRepo = this.getProviderRepo(provider);
-    if (staticRepo) {
-      return staticRepo;
-    }
-    
-    return await this.discoverProviderRepo(provider);
-  }
-
-  /**
-   * Fetch resource examples from GitHub repository with caching
-   */
-  async fetchResourceExamples(provider: string, resource: string): Promise<string[]> {
-    const cacheKey = CacheService.generateKey('examples', provider, resource);
-    
-    // Try cache first
-    const cached = await this.cache.get<string[]>(cacheKey);
-    if (cached) {
-      return cached;
-    }
-
-    try {
-      const repo = await this.getRepoOrDiscover(provider);
-      if (!repo) {
-        const emptyResult: string[] = [];
-        await this.cache.set(cacheKey, emptyResult, CACHE_TTL.ERROR_RESPONSE);
-        return emptyResult;
-      }
-      
-      // Try different common paths for examples
-      const possiblePaths = [
-        `examples/${resource}`,
-        `examples/resources/${resource}`,
-        `examples/r/${resource}`,
-        `examples/resources/${provider}_${resource}`,
-        `examples/r/${provider}_${resource}`,
-        `website/docs/resources/${resource}.html.markdown`,
-        `website/docs/r/${resource}.html.markdown`,
-        `website/docs/r/${provider}_${resource}.html.markdown`
-      ];
-      
-      const examples: string[] = [];
-      
-      // Try paths in order of priority, stop on first success
-      for (const path of possiblePaths) {
+      res.on('end', () => {
         try {
-          const content = await this.githubRawGet(repo.owner, repo.name, repo.defaultBranch, path);
-          
-          if (content.trim()) {
-            // For HTML/Markdown files, extract code blocks
-            if (path.endsWith('.html.markdown') || path.endsWith('.md')) {
-              const extracted = this.extractCodeBlocks(content);
-              if (extracted.length > 0) {
-                examples.push(...extracted);
-                break; // Found examples, stop searching
+          const parsedData = JSON.parse(data);
+          resolve(parsedData);
+        } catch (error) {
+          // Handle parsing error with proper type annotation
+          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+          reject(new Error(`Failed to parse GitHub API response: ${errorMessage}`));
+        }
+      });
+    }).on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+/**
+ * HTTP request function for raw GitHub content
+ */
+export function githubRawGet(owner: string, repo: string, branch: string, path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'raw.githubusercontent.com',
+      path: `/${owner}/${repo}/${branch}/${path}`,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'terraform-docs-mcp'
+      }
+    };
+
+    https.get(options, (res) => {
+      let data = '';
+      
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      
+      res.on('end', () => {
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(data);
+        } else {
+          reject(new Error(`HTTP Error: ${res.statusCode} for path ${path}`));
+        }
+      });
+    }).on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Get GitHub repository information for a provider
+ */
+export function getProviderRepo(provider: string): GitHubRepo | null {
+  return PROVIDER_REPOS[provider] || null;
+}
+
+/**
+ * Dynamically discover the GitHub repository for a provider
+ * This is a fallback when the provider is not in our static mapping
+ */
+export async function discoverProviderRepo(provider: string): Promise<GitHubRepo | null> {
+  try {
+    // First try to search for the repository
+    const searchRes = await githubApiGet(`/search/repositories?q=terraform-provider-${provider}+in:name&sort=stars&order=desc`);
+    
+    if (searchRes.items && searchRes.items.length > 0) {
+      const topRepo = searchRes.items[0];
+      return {
+        owner: topRepo.owner.login,
+        name: topRepo.name,
+        defaultBranch: topRepo.default_branch
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`Failed to discover GitHub repository for provider: ${provider}`, error);
+    return null;
+  }
+}
+
+/**
+ * Get repository content (file or directory listing)
+ */
+export async function getRepoContent(repo: GitHubRepo, path: string): Promise<any> {
+  try {
+    return await githubApiGet(`/repos/${repo.owner}/${repo.name}/contents/${path}?ref=${repo.defaultBranch}`);
+  } catch (error) {
+    console.error(`Failed to get repository content for path: ${path}`, error);
+    throw error;
+  }
+}
+
+/**
+ * Get repository information from static mapping or discover dynamically
+ */
+export async function getRepoOrDiscover(provider: string): Promise<GitHubRepo | null> {
+  const staticRepo = getProviderRepo(provider);
+  if (staticRepo) {
+    return staticRepo;
+  }
+  
+  return await discoverProviderRepo(provider);
+}
+
+/**
+ * Fetch resource examples from GitHub repository
+ */
+export async function fetchResourceExamples(provider: string, resource: string): Promise<string[]> {
+  try {
+    const repo = await getRepoOrDiscover(provider);
+    if (!repo) {
+      throw new Error(`Could not find GitHub repository for provider: ${provider}`);
+    }
+    
+    // Try different common paths for examples
+    const possiblePaths = [
+      `examples/${resource}`,
+      `examples/resources/${resource}`,
+      `examples/r/${resource}`,
+      `examples/resources/${provider}_${resource}`,
+      `examples/r/${provider}_${resource}`,
+      `website/docs/resources/${resource}.html.markdown`,
+      `website/docs/r/${resource}.html.markdown`,
+      `website/docs/r/${provider}_${resource}.html.markdown`
+    ];
+    
+    const examples: string[] = [];
+    
+    for (const path of possiblePaths) {
+      try {
+        // Try to get the content of the file directly
+        const content = await githubRawGet(repo.owner, repo.name, repo.defaultBranch, path);
+        
+        // For HTML/Markdown files, extract code blocks
+        if (path.endsWith('.html.markdown') || path.endsWith('.md')) {
+          const extracted = extractCodeBlocks(content);
+          if (extracted.length > 0) {
+            examples.push(...extracted);
+          }
+        } else {
+          // For directory examples, we need to list files and fetch them
+          try {
+            const dirContent = await githubApiGet(`/repos/${repo.owner}/${repo.name}/contents/${path}?ref=${repo.defaultBranch}`);
+            
+            if (Array.isArray(dirContent)) {
+              // It's a directory, fetch .tf files
+              for (const file of dirContent) {
+                if (file.name.endsWith('.tf')) {
+                  const fileContent = await githubRawGet(repo.owner, repo.name, repo.defaultBranch, file.path);
+                  examples.push(fileContent);
+                }
               }
             } else {
+              // It's a file, add its content
               examples.push(content);
-              break; // Found examples, stop searching
             }
+          } catch (dirError) {
+            // Not a directory or couldn't access it, use the content we already have
+            examples.push(content);
           }
-        } catch (error) {
-          // Continue to next path if this one fails
-          continue;
         }
+        
+        // If we found examples, we can stop looking
+        if (examples.length > 0) {
+          break;
+        }
+      } catch (e) {
+        // Continue to next path if this one fails
+        continue;
       }
-      
-      // Cache the result
-      await this.cache.set(cacheKey, examples, CACHE_TTL.EXAMPLES);
-      return examples;
-    } catch (error) {
-      console.error(`Failed to fetch resource examples from GitHub: ${error}`);
-      const emptyResult: string[] = [];
-      await this.cache.set(cacheKey, emptyResult, CACHE_TTL.ERROR_RESPONSE);
-      return emptyResult;
     }
-  }
-
-  /**
-   * Fetch resource schema from GitHub repository with improved caching and error handling
-   */
-  async fetchResourceSchemaFromGithub(provider: string, resource: string): Promise<Schema> {
-    const cacheKey = CacheService.generateKey('schema', provider, resource);
     
-    // Try cache first
-    const cached = await this.cache.get<Schema>(cacheKey);
-    if (cached) {
-      return cached;
-    }
+    return examples;
+  } catch (error) {
+    console.error(`Failed to fetch resource examples from GitHub: ${error}`);
+    return [];
+  }
+}
 
-    try {
-      const repo = await this.getRepoOrDiscover(provider);
-      if (!repo) {
-        const emptySchema = this.createEmptySchema(provider, resource);
-        await this.cache.set(cacheKey, emptySchema, CACHE_TTL.ERROR_RESPONSE);
-        return emptySchema;
-      }
-      
-      // Get prioritized paths for this provider
-      const possiblePaths = this.getPrioritizedSchemaPaths(provider, resource, repo);
-      
-      // Try paths in order of priority
-      for (const path of possiblePaths) {
-        try {
-          console.error(`Trying to fetch schema from: ${path}`);
-          const content = await this.githubRawGet(repo.owner, repo.name, repo.defaultBranch, path);
-          
-          // Parse Go code to extract schema information
-          const schema = this.parseGoSchema(content, resource, provider);
-          
-          // If we found a valid schema, add metadata and cache it
-          if (schema && Object.keys(schema.attributes).length > 0) {
-            schema.resourceName = resource;
-            schema.providerName = provider;
-            schema.sourceUrl = `https://github.com/${repo.owner}/${repo.name}/blob/${repo.defaultBranch}/${path}`;
-            
-            // Cache successful result
-            await this.cache.set(cacheKey, schema, CACHE_TTL.SCHEMA);
-            return schema;
-          }
-        } catch (error) {
-          // Continue to next path if this one fails
-          const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-          console.error(`Failed for path ${path}: ${errorMessage}`);
-          continue;
-        }
-      }
-      
-      // If we couldn't find a schema, return empty schema and cache it briefly
-      const emptySchema = this.createEmptySchema(provider, resource);
-      await this.cache.set(cacheKey, emptySchema, CACHE_TTL.ERROR_RESPONSE);
-      return emptySchema;
-    } catch (error) {
-      console.error(`Failed to fetch resource schema from GitHub: ${error}`);
-      
-      // Return and cache empty schema on error
-      const emptySchema = this.createEmptySchema(provider, resource);
-      await this.cache.set(cacheKey, emptySchema, CACHE_TTL.ERROR_RESPONSE);
-      return emptySchema;
+/**
+ * Extract Terraform code blocks from markdown content
+ */
+function extractCodeBlocks(markdownContent: string): string[] {
+  const codeBlocks: string[] = [];
+  
+  // Match code blocks with terraform, hcl, or no language specified
+  const codeBlockRegex = /```(?:terraform|hcl|)([\s\S]*?)```/g;
+  
+  let match;
+  while ((match = codeBlockRegex.exec(markdownContent)) !== null) {
+    const code = match[1].trim();
+    
+    // Only include blocks that look like Terraform code
+    if (code.includes('resource') || code.includes('provider') || code.includes('data') || code.includes('variable')) {
+      codeBlocks.push(code);
     }
   }
+  
+  return codeBlocks;
+}
 
-  /**
-   * Get prioritized schema paths for a provider/resource combination
-   */
-  private getPrioritizedSchemaPaths(provider: string, resource: string, repo: GitHubRepo): string[] {
+/**
+ * Fetch resource schema from GitHub repository with improved schema extraction
+ */
+export async function fetchResourceSchemaFromGithub(provider: string, resource: string): Promise<Schema> {
+  try {
+    const repo = await getRepoOrDiscover(provider);
+    if (!repo) {
+      throw new Error(`Could not find GitHub repository for provider: ${provider}`);
+    }
+    
+    // Format resource name to match different naming patterns
     const resourceName = resource.replace(/-/g, '_');
     const providerResourceName = `${provider}_${resourceName}`;
     
-    // Use provider-specific patterns if available
-    if (repo.schemaPatterns) {
-      return repo.schemaPatterns.map(pattern => 
-        pattern
-          .replace('{resource}', resourceName)
-          .replace('{provider}', provider)
-      );
-    }
-    
-    // Default patterns ordered by likelihood of success
-    return [
+    // Try different common paths for schema definitions
+    const possiblePaths = [
       // Most common modern pattern with internal/service directories
       `internal/service/${resourceName}/resource_${resourceName}.go`,
       `internal/service/${resourceName}/resource_${provider}_${resourceName}.go`,
@@ -370,240 +431,387 @@ export class GitHubService {
       `internal/provider/resource_${resourceName}.go`,
       `internal/provider/resource_${provider}_${resourceName}.go`,
       
-      // Provider-specific patterns
-      ...(provider === 'aws' ? [
-        `internal/service/${resourceName}/${resourceName}.go`,
-        `aws/resource_aws_${resourceName}.go`
-      ] : []),
-      
-      ...(provider === 'google' ? [
-        `google/resource_${resourceName}.go`,
-        `google/services/${resourceName}/resource_${resourceName}.go`
-      ] : []),
-      
-      ...(provider === 'azurerm' ? [
-        `azurerm/internal/services/${resourceName}/resource_arm_${resourceName}.go`,
-        `internal/services/${resourceName}/${resourceName}_resource.go`
-      ] : []),
-      
-      // Fallback patterns
+      // Older patterns
       `${resourceName}/resource_${provider}_${resourceName}.go`,
       `${resourceName}/resource.go`,
+      
+      // AWS specific patterns
+      `internal/service/${resourceName}/${resourceName}.go`,
+      
+      // Google specific patterns
+      `google/resource_${resourceName}.go`,
+      
+      // Azure specific patterns
+      `azurerm/internal/services/${resourceName}/resource_arm_${resourceName}.go`,
+      
+      // Fallback to searching in schema.go files
+      `internal/service/${resourceName}/schema.go`,
+      `internal/services/${resourceName}/schema.go`,
+      `internal/schema/${resourceName}.go`,
     ];
-  }
-
-  /**
-   * Create an empty schema with basic structure
-   */
-  private createEmptySchema(provider: string, resource: string): Schema {
+    
+    for (const path of possiblePaths) {
+      try {
+        console.error(`Trying to fetch schema from: ${path}`);
+        const content = await githubRawGet(repo.owner, repo.name, repo.defaultBranch, path);
+        
+        // Parse Go code to extract schema information
+        const schema = parseGoSchema(content, resource, provider);
+        
+        // If we found a schema, add metadata and return it
+        if (schema && Object.keys(schema.attributes).length > 0) {
+          schema.resourceName = resource;
+          schema.providerName = provider;
+          schema.sourceUrl = `https://github.com/${repo.owner}/${repo.name}/blob/${repo.defaultBranch}/${path}`;
+          
+          return schema;
+        }
+      } catch (e) {
+        // Continue to next path if this one fails
+        const errorMessage = e instanceof Error ? e.message : 'Unknown error';
+        console.error(`Failed for path ${path}: ${errorMessage}`);
+        continue;
+      }
+    }
+    
+    // If we couldn't find a schema in dedicated files, try to parse resource registry
+    try {
+      const registryContent = await githubRawGet(repo.owner, repo.name, repo.defaultBranch, 'internal/provider/provider.go');
+      const schema = parseRegistryResources(registryContent, resource, provider);
+      
+      if (schema && Object.keys(schema.attributes).length > 0) {
+        schema.resourceName = resource;
+        schema.providerName = provider;
+        schema.sourceUrl = `https://github.com/${repo.owner}/${repo.name}/blob/${repo.defaultBranch}/internal/provider/provider.go`;
+        
+        return schema;
+      }
+    } catch (e) {
+      const errorMessage = e instanceof Error ? e.message : 'Unknown error';
+      console.error(`Failed to parse provider registry: ${errorMessage}`);
+    }
+    
+    // Return a minimal schema if we couldn't find a complete one
+    return {
+      attributes: {},
+      resourceName: resource,
+      providerName: provider
+    };
+  } catch (error) {
+    console.error(`Failed to fetch resource schema from GitHub: ${error}`);
+    
+    // Return a minimal schema if we couldn't find a complete one
     return {
       attributes: {},
       resourceName: resource,
       providerName: provider
     };
   }
+}
 
-  /**
-   * Extract Terraform code blocks from markdown content
-   */
-  private extractCodeBlocks(markdownContent: string): string[] {
-    const codeBlocks: string[] = [];
+/**
+ * Parse Go code to extract schema definition with enhanced parsing
+ */
+function parseGoSchema(goCode: string, resource: string, provider: string): Schema {
+  // Initialize the schema
+  const schema: Schema = {
+    attributes: {},
+    blockTypes: {}
+  };
+  
+  try {
+    // Extract the schema definition section
+    let schemaSection = extractSchemaSection(goCode, resource, provider);
     
-    // Match code blocks with terraform, hcl, or no language specified
-    const codeBlockRegex = /```(?:terraform|hcl|)([\s\S]*?)```/g;
-    
-    let match;
-    while ((match = codeBlockRegex.exec(markdownContent)) !== null) {
-      const code = match[1].trim();
-      
-      // Only include blocks that look like Terraform code
-      if (code.includes('resource') || code.includes('provider') || code.includes('data') || code.includes('variable')) {
-        codeBlocks.push(code);
-      }
-    }
-    
-    return codeBlocks;
-  }
-
-  /**
-   * Parse Go code to extract schema definition with enhanced parsing
-   */
-  private parseGoSchema(goCode: string, resource: string, provider: string): Schema {
-    // Initialize the schema
-    const schema: Schema = {
-      attributes: {},
-      blockTypes: {}
-    };
-    
-    try {
-      // Extract the schema definition section
-      const schemaSection = this.extractSchemaSection(goCode, resource, provider);
-      
-      if (!schemaSection) {
-        return schema;
-      }
-      
-      // Parse attributes from the schema section
-      this.parseAttributes(schemaSection, schema);
-      
-      // Also try to find and parse defined block types
-      this.parseBlockTypes(schemaSection, schema);
-      
-      return schema;
-    } catch (error) {
-      console.error(`Error parsing Go schema: ${error}`);
+    if (!schemaSection) {
       return schema;
     }
-  }
-
-  /**
-   * Extract the schema section from Go code
-   */
-  private extractSchemaSection(goCode: string, resource: string, provider: string): string | null {
-    // Try to find the Schema definition with several patterns
-    const schemaPatterns = [
-      // Pattern 1: Standard schema map in resource definition
-      /Schema:\s*map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*,\s*\n\s*\w+:|\}\s*,\s*\})/,
-      
-      // Pattern 2: Schema with ResourceSchema
-      /ResourceSchema:\s*map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*,\s*\n\s*\w+:|\}\s*,\s*\})/,
-      
-      // Pattern 3: Schema in a separate variable
-      /var\s+\w+Schema\s*=\s*map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*\n)/,
-      
-      // Pattern 4: Schema as a function return
-      /func\s+\w+Schema\s*\(\s*\)\s*map\[string\]\*schema\.Schema\s*\{\s*return\s+map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*\n\s*\})/,
-    ];
     
-    for (const pattern of schemaPatterns) {
-      const match = pattern.exec(goCode);
-      if (match && match[1]) {
-        return match[1];
-      }
-    }
+    // Parse attributes from the schema section
+    parseAttributes(schemaSection, schema);
     
-    return null;
-  }
-
-  /**
-   * Parse attributes from the schema section
-   */
-  private parseAttributes(schemaSection: string, schema: Schema): void {
-    // Regular expression to find attribute definitions
-    const attributeRegex = /"([^"]+)":\s*{\s*([\s\S]*?)(?="\w+":|}\s*,\s*$|}\s*,\s*\/\/|},\s*\/\/|},\s*$)/g;
+    // Also try to find and parse defined block types
+    parseBlockTypes(schemaSection, schema);
     
-    let match;
-    while ((match = attributeRegex.exec(schemaSection)) !== null) {
-      const attributeName = match[1];
-      const attributeDefinition = match[2];
-      
-      // Skip schema merges and functions
-      if (attributeName === '//' || attributeDefinition.trim().startsWith('func(')) {
-        continue;
-      }
-      
-      // Parse attribute properties
-      const attribute = this.parseAttributeProperties(attributeDefinition);
-      
-      // Add to schema
-      schema.attributes[attributeName] = attribute;
-    }
-  }
-
-  /**
-   * Parse attribute properties from a definition string
-   */
-  private parseAttributeProperties(definition: string): SchemaAttribute {
-    const attribute: SchemaAttribute = {
-      description: "",
-      required: false,
-      optional: false,
-      computed: false
-    };
-    
-    // Find description
-    const descriptionMatch = /Description:\s*"([^"]*)"/.exec(definition);
-    if (descriptionMatch) {
-      attribute.description = descriptionMatch[1];
-    }
-    
-    // Find required flag
-    const requiredMatch = /Required:\s*(true|false)/.exec(definition);
-    if (requiredMatch) {
-      attribute.required = requiredMatch[1] === 'true';
-    }
-    
-    // Find optional flag
-    const optionalMatch = /Optional:\s*(true|false)/.exec(definition);
-    if (optionalMatch) {
-      attribute.optional = optionalMatch[1] === 'true';
-    }
-    
-    // Find computed flag
-    const computedMatch = /Computed:\s*(true|false)/.exec(definition);
-    if (computedMatch) {
-      attribute.computed = computedMatch[1] === 'true';
-    }
-    
-    // Find type
-    const typeMatch = /Type:\s*schema\.([\w]+)/.exec(definition);
-    if (typeMatch) {
-      attribute.type = typeMatch[1].toLowerCase();
-    }
-    
-    return attribute;
-  }
-
-  /**
-   * Parse block types from schema section 
-   */
-  private parseBlockTypes(schemaSection: string, schema: Schema): void {
-    // Implementation similar to original but with better error handling
-    // Simplified for brevity - you can keep the original implementation
-  }
-
-  /**
-   * Get cache statistics
-   */
-  getCacheStats() {
-    return this.cache.getStats();
-  }
-
-  /**
-   * Get rate limit information
-   */
-  getRateLimitInfo() {
-    return this.rateLimiter.getRateLimitInfo();
-  }
-
-  /**
-   * Clear cache (useful for testing)
-   */
-  clearCache(): void {
-    this.cache.clear();
-  }
-
-  /**
-   * Destroy service and cleanup resources
-   */
-  destroy(): void {
-    this.cache.destroy();
+    return schema;
+  } catch (error) {
+    console.error(`Error parsing Go schema: ${error}`);
+    return schema;
   }
 }
 
-// Export singleton instance and individual functions for backward compatibility
-const githubService = new GitHubService();
+/**
+ * Extract the schema section from Go code
+ */
+function extractSchemaSection(goCode: string, resource: string, provider: string): string | null {
+  // Try to find the Schema definition with several patterns
+  const schemaPatterns = [
+    // Pattern 1: Standard schema map in resource definition
+    /Schema:\s*map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*,\s*\n\s*\w+:|\}\s*,\s*\})/,
+    
+    // Pattern 2: Schema with ResourceSchema
+    /ResourceSchema:\s*map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*,\s*\n\s*\w+:|\}\s*,\s*\})/,
+    
+    // Pattern 3: Schema in a separate variable
+    /var\s+\w+Schema\s*=\s*map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*\n)/,
+    
+    // Pattern 4: Schema as a function return
+    /func\s+\w+Schema\s*\(\s*\)\s*map\[string\]\*schema\.Schema\s*\{\s*return\s+map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*\n\s*\})/,
+    
+    // Pattern 5: AWS style with merged schemas
+    /func\s+resource\w+\(\)\s*\*schema\.Resource\s*\{[\s\S]*?Schema:\s*map\[string\]\*schema\.Schema\{([\s\S]*?)(?:\}\s*,\s*\n\s*\w+:|\}\s*,\s*\})/
+  ];
+  
+  for (const pattern of schemaPatterns) {
+    const match = pattern.exec(goCode);
+    if (match && match[1]) {
+      return match[1];
+    }
+  }
+  
+  return null;
+}
 
-export const githubApiGet = (path: string) => githubService.githubApiGet(path);
-export const githubRawGet = (owner: string, repo: string, branch: string, path: string) => 
-  githubService.githubRawGet(owner, repo, branch, path);
-export const getProviderRepo = (provider: string) => githubService.getProviderRepo(provider);
-export const discoverProviderRepo = (provider: string) => githubService.discoverProviderRepo(provider);
-export const getRepoOrDiscover = (provider: string) => githubService.getRepoOrDiscover(provider);
-export const fetchResourceExamples = (provider: string, resource: string) => 
-  githubService.fetchResourceExamples(provider, resource);
-export const fetchResourceSchemaFromGithub = (provider: string, resource: string) => 
-  githubService.fetchResourceSchemaFromGithub(provider, resource);
+/**
+ * Parse attributes from the schema section
+ */
+function parseAttributes(schemaSection: string, schema: Schema): void {
+  // Regular expression to find attribute definitions
+  // This regex matches attribute definitions with all their properties
+  const attributeRegex = /"([^"]+)":\s*{\s*([\s\S]*?)(?="\w+":|}\s*,\s*$|}\s*,\s*\/\/|},\s*\/\/|},\s*$)/g;
+  
+  let match;
+  while ((match = attributeRegex.exec(schemaSection)) !== null) {
+    const attributeName = match[1];
+    const attributeDefinition = match[2];
+    
+    // Skip schema merges and functions
+    if (attributeName === '//') continue;
+    if (attributeDefinition.trim().startsWith('func(')) continue;
+    
+    // Parse attribute properties
+    const attribute = parseAttributeProperties(attributeDefinition);
+    
+    // Add to schema
+    schema.attributes[attributeName] = attribute;
+  }
+}
 
-// Export service instance for advanced usage
-export { githubService };
+/**
+ * Parse attribute properties from a definition string
+ */
+function parseAttributeProperties(definition: string): SchemaAttribute {
+  const attribute: SchemaAttribute = {
+    description: "",
+    required: false,
+    optional: false,
+    computed: false
+  };
+  
+  // Find description
+  const descriptionMatch = /Description:\s*"([^"]*)"/.exec(definition);
+  if (descriptionMatch) {
+    attribute.description = descriptionMatch[1];
+  }
+  
+  // Find required flag
+  const requiredMatch = /Required:\s*(true|false)/.exec(definition);
+  if (requiredMatch) {
+    attribute.required = requiredMatch[1] === 'true';
+  }
+  
+  // Find optional flag
+  const optionalMatch = /Optional:\s*(true|false)/.exec(definition);
+  if (optionalMatch) {
+    attribute.optional = optionalMatch[1] === 'true';
+  }
+  
+  // Find computed flag
+  const computedMatch = /Computed:\s*(true|false)/.exec(definition);
+  if (computedMatch) {
+    attribute.computed = computedMatch[1] === 'true';
+  }
+  
+  // Find force new flag (important for Terraform plan logic)
+  const forceNewMatch = /ForceNew:\s*(true|false)/.exec(definition);
+  if (forceNewMatch) {
+    attribute.forcenew = forceNewMatch[1] === 'true';
+  }
+  
+  // Find sensitive flag (important for security)
+  const sensitiveMatch = /Sensitive:\s*(true|false)/.exec(definition);
+  if (sensitiveMatch) {
+    attribute.sensitive = sensitiveMatch[1] === 'true';
+  }
+  
+  // Find deprecated flag
+  const deprecatedMatch = /Deprecated:\s*(true|false)/.exec(definition);
+  if (deprecatedMatch) {
+    attribute.deprecated = deprecatedMatch[1] === 'true';
+  }
+  
+  // Find type
+  const typeMatch = /Type:\s*schema\.([\w]+)/.exec(definition);
+  if (typeMatch) {
+    attribute.type = typeMatch[1].toLowerCase();
+    
+    // For collection types, find element type
+    if (['list', 'set', 'map'].includes(attribute.type || '')) {
+      const elemMatch = /Elem:\s*&schema\.([\w]+){/.exec(definition);
+      const resourceElemMatch = /Elem:\s*&schema\.Resource{/.exec(definition);
+      
+      if (elemMatch) {
+        attribute.elem = {
+          type: elemMatch[1].toLowerCase()
+        };
+      } else if (resourceElemMatch) {
+        // Handle nested schema
+        attribute.elem = {
+          type: 'resource'
+        };
+        
+        // Try to parse nested schema
+        const nestedSchemaMatch = /Elem:\s*&schema\.Resource{[\s\S]*?Schema:\s*map\[string\]\*schema\.Schema{([\s\S]*?)}\s*,/.exec(definition);
+        if (nestedSchemaMatch) {
+          const nestedSchema: Schema = {
+            attributes: {}
+          };
+          
+          parseAttributes(nestedSchemaMatch[1], nestedSchema);
+          attribute.nested = nestedSchema.attributes;
+        }
+      }
+    }
+  }
+  
+  // Find default value
+  const defaultValueMatch = /Default:\s*([^,\n]+)/.exec(definition);
+  if (defaultValueMatch) {
+    try {
+      // Try to parse complex defaults like objects or arrays
+      if (defaultValueMatch[1].trim().startsWith('{') || 
+          defaultValueMatch[1].trim().startsWith('[')) {
+        attribute.default = defaultValueMatch[1].trim();
+      } else if (defaultValueMatch[1].trim() === 'true' || 
+                defaultValueMatch[1].trim() === 'false') {
+        attribute.default = defaultValueMatch[1].trim() === 'true';
+      } else if (!isNaN(Number(defaultValueMatch[1].trim()))) {
+        attribute.default = Number(defaultValueMatch[1].trim());
+      } else {
+        attribute.default = defaultValueMatch[1].trim();
+      }
+    } catch (e) {
+      attribute.default = defaultValueMatch[1].trim();
+    }
+  }
+  
+  // Find validation functions
+  const validationMatch = /ValidateFunc:\s*([^,\n]+)/.exec(definition);
+  if (validationMatch) {
+    attribute.validationfuncs = [validationMatch[1].trim()];
+  }
+  
+  return attribute;
+}
+
+/**
+ * Parse block types from schema section 
+ */
+function parseBlockTypes(schemaSection: string, schema: Schema): void {
+  // Look for schema.Resource blocks which indicate nested block types
+  const blockRegex = /"([^"]+)":\s*{\s*Type:\s*schema\.([\w]+),\s*[\s\S]*?Elem:\s*&schema\.Resource{[\s\S]*?Schema:\s*map\[string\]\*schema\.Schema{([\s\S]*?)}[\s\S]*?}/g;
+  
+  let match;
+  while ((match = blockRegex.exec(schemaSection)) !== null) {
+    const blockName = match[1];
+    const blockType = match[2].toLowerCase();
+    const blockSchema = match[3];
+    
+    // Create nested schema
+    const nestedSchema: Schema = {
+      attributes: {}
+    };
+    
+    // Parse attributes in the nested schema
+    parseAttributes(blockSchema, nestedSchema);
+    
+    // Add to block types
+    if (!schema.blockTypes) {
+      schema.blockTypes = {};
+    }
+    
+    schema.blockTypes[blockName] = {
+      nesting: blockType,
+      block: {
+        attributes: nestedSchema.attributes
+      }
+    };
+    
+    // Extract min/max items if specified
+    const minItemsMatch = /MinItems:\s*(\d+)/.exec(match[0]);
+    if (minItemsMatch) {
+      schema.blockTypes[blockName].min_items = parseInt(minItemsMatch[1], 10);
+    }
+    
+    const maxItemsMatch = /MaxItems:\s*(\d+)/.exec(match[0]);
+    if (maxItemsMatch) {
+      schema.blockTypes[blockName].max_items = parseInt(maxItemsMatch[1], 10);
+    }
+  }
+}
+
+/**
+ * Parse resources from the provider registry in provider.go
+ */
+function parseRegistryResources(providerCode: string, targetResource: string, provider: string): Schema | null {
+  // Look for the resource registration in the ResourcesMap
+  const resourceMapRegex = /ResourcesMap:\s*map\[string\]\*schema\.Resource{([\s\S]*?)},/;
+  const match = resourceMapRegex.exec(providerCode);
+  
+  if (!match) {
+    return null;
+  }
+  
+  const resourcesSection = match[1];
+  
+  // Find the specific resource
+  const resourcePatterns = [
+    new RegExp(`"${provider}_${targetResource}":\\s*resource(\\w+)\\(\\)`, 'i'),
+    new RegExp(`"${provider}_${targetResource}":\\s*\\w+\\.resource(\\w+)\\(\\)`, 'i')
+  ];
+  
+  for (const pattern of resourcePatterns) {
+    const resourceMatch = pattern.exec(resourcesSection);
+    if (resourceMatch) {
+      // We found a reference to the resource function, but we need the actual schema
+      // For this, we'd need to find the resource function implementation
+      // This would typically require more code analysis beyond this file
+      
+      // Return a placeholder - in a real implementation you'd need to follow the reference
+      return {
+        attributes: {
+          // Add some common attributes as a fallback
+          id: {
+            description: "The ID of the resource",
+            required: false,
+            computed: true,
+            type: "string"
+          },
+          name: {
+            description: "The name of the resource",
+            required: true,
+            type: "string"
+          },
+          tags: {
+            description: "Tags to assign to the resource",
+            required: false,
+            optional: true,
+            type: "map"
+          }
+        }
+      };
+    }
+  }
+  
+  return null;
+}
