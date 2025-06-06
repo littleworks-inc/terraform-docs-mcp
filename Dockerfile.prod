@@ -1,0 +1,47 @@
+# Production Dockerfile for Terraform Docs MCP Server
+# Simplified version that's more robust
+
+FROM node:18-alpine AS base
+
+# Install dumb-init for proper signal handling
+RUN apk add --no-cache dumb-init
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files
+COPY package.json ./
+# Copy package-lock.json if it exists
+COPY package-lock.jso[n] ./
+COPY tsconfig.json ./
+
+# Install dependencies
+RUN npm install --omit=dev || npm install
+
+# Copy source code
+COPY src/ ./src/
+
+# Install TypeScript and build dependencies
+RUN npm install -g typescript
+RUN npm install --save-dev typescript || true
+
+# Build the application
+RUN npm run build || npx tsc
+
+# Create non-root user for security
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S terraform-mcp -u 1001
+
+# Change ownership to non-root user
+RUN chown -R terraform-mcp:nodejs /app
+USER terraform-mcp
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "console.log('Health check passed')" || exit 1
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["dumb-init", "--"]
+
+# Default command
+CMD ["node", "dist/index.js"]

@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  terraform-mcp-dev-simple:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev-simple
+      target: development
+    container_name: terraform-mcp-dev-simple
+    volumes:
+      # Only mount source code for hot reload
+      - ./src:/app/src:ro
+    environment:
+      - NODE_ENV=development
+      - DEBUG=terraform-mcp:*
+    # No port exposure needed for MCP stdio transport
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    networks:
+      - terraform-mcp-network-simple
+
+networks:
+  terraform-mcp-network-simple:
+    driver: bridge
